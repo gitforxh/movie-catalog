@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scan a movies folder, look up metadata (OMDb), write movies.html.
 
-Usage: python3 build.py [/Volumes/movies]
+Usage: python3 build.py [folder ...]   (default: /Volumes/movies and /Volumes/movies-2T)
 Key: OMDB_API_KEY in env or in ./.env
 Results are cached in cache.json, so re-runs only look up new movies.
 """
@@ -11,10 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).parent
-ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else "/Volumes/movies")
-SKIP_DIRS = {"TV", "tmp"}
+ROOTS = [Path(p) for p in sys.argv[1:]] or [Path("/Volumes/movies"), Path("/Volumes/movies-2T")]
+SKIP_DIRS = {"TV", "tmp", "TVseries", "upload", "4k"}
 VIDEO = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
 CACHE = HERE / "cache.json"
+OVERRIDES = json.loads((HERE / "overrides.json").read_text()) if (HERE / "overrides.json").exists() else {}
 
 
 def load_env():
@@ -30,20 +31,47 @@ def load_env():
 
 ENV = load_env()
 OMDB = ENV.get("OMDB_API_KEY")
+TMDB = ENV.get("TMDB_API_KEY")
 
 JUNK = re.compile(
-    r"\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|brrip|bdrip|web-?dl|web-?rip|webrip|hdrip|hdtv|"
+    r"\b(3d|hsbs|half-?sbs|sbs|3dtv|hc|2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|brrip|bdrip|web-?dl|web-?rip|webrip|hdrip|hdtv|"
     r"dvdrip|x26[45]|h\.?26[45]|hevc|10bit|8bit|aac\S*|ddp\S*|dts\S*|atmos|5\.1|7\.1|extended|"
     r"remastered|imax|repack|proper|dual|amzn|nf|itunes|yts|yify|rarbg)\b.*",
     re.I,
 )
 
 
+CJK = re.compile(r"[\u4e00-\u9fff]")
+CJK_CUT = re.compile(r"(?i)(HDTC|HD|BD|TC|DVD|TS|WEB|BluRay|\d{3,4}p|4K)")
+
+
 def parse_name(name):
     """Return (title, year|None) from a messy release name."""
+    if CJK.search(name):  # e.g. "2017水形物语HD1080P中字.mp4": year, Chinese title, then quality tags
+        base = re.sub(r"\.(mkv|mp4|avi|m4v|mov|wmv|ts)$", "", name, flags=re.I)
+        ym = re.match(r"((?:19|20)\d\d)[\s._-]*", base)
+        year = int(ym.group(1)) if ym else None
+        rest = base[ym.end():] if ym else base
+        cut = CJK_CUT.search(rest)
+        rest = (rest[: cut.start()] if cut else rest).strip(" -_.")
+        rest = re.split(r"\s+", rest)[0]  # later words are site ads / dub notes
+        parts = []
+        for seg in rest.split("."):  # "神奇动物.格林德沃之罪.2018": keep Chinese segments, stop at Latin/year
+            if not CJK.search(seg):
+                ys = re.fullmatch(r"(?:19|20)\d\d", seg)
+                year = year or (int(seg) if ys else None)
+                if parts:
+                    break
+                continue
+            parts.append(seg)
+        return " ".join(parts) or rest, year
     base = re.sub(r"\.(mkv|mp4|avi|m4v|mov|wmv|ts)$", "", name, flags=re.I)
     base = re.sub(r"\[[^\]]*\]", " ", base)
     base = re.sub(r"[._]", " ", base)
+    base = re.sub(r"^3D ", "", base)
+    lead = re.match(r"((?:19|20)\d\d) (?=\S)", base)
+    if lead and re.search(r"(?:19|20)\d\d\D*$", base[5:]):  # "2001 Title 2001": year is a prefix, not the title
+        base = base[5:]
     m = None
     for m in re.finditer(r"[\(\s]((?:19|20)\d\d)\b", " " + base):
         pass  # take the last plausible year
@@ -58,16 +86,34 @@ def parse_name(name):
 
 def scan():
     found = {}
-    for d in sorted(ROOT.iterdir()):
-        if not d.is_dir() or d.name in SKIP_DIRS or d.name.startswith("."):
+    for root in ROOTS:
+        if not root.is_dir():
+            print(f"skipping {root} - not mounted")
             continue
-        for e in sorted(d.iterdir()):
-            if e.name.startswith(".") or e.name in {"@eaDir", "#recycle"}:
+        for d in sorted(root.iterdir()):
+            if not d.is_dir() or d.name in SKIP_DIRS or d.name.startswith("."):
                 continue
-            if e.is_dir() or e.suffix.lower() in VIDEO:
-                title, year = parse_name(e.name)
-                if title:
-                    found[f"{d.name}/{e.name}"] = {"title": title, "year": year, "path": f"{d.name}/{e.name}"}
+            entries = []
+            for e in sorted(d.iterdir()):
+                if e.is_dir() and re.fullmatch(r"(?:19|20)\d\d( and before)?", e.name):  # cartoon/<year>/<movie>
+                    entries += sorted(e.iterdir())
+                else:
+                    entries.append(e)
+            for e in entries:
+                if e.name.startswith(".") or e.name in {"@eaDir", "#recycle"}:
+                    continue
+                if re.search(r"\bS\d{2}E\d{2}\b", e.name, re.I):
+                    continue  # TV episode
+                if e.is_dir() or e.suffix.lower() in VIDEO:
+                    title, year = parse_name(e.name)
+                    if title:
+                        p = str(e.relative_to(root.parent))  # relative to /Volumes
+                        ov = OVERRIDES.get(p)
+                        if ov and ov.get("hide"):
+                            continue
+                        if ov:
+                            title, year = ov.get("title", title), ov.get("year", year)
+                        found[p] = {"title": title, "year": year, "path": p, "ov": ov}
     return list(found.values())
 
 
@@ -92,42 +138,164 @@ def backfill_date(m):
     return m
 
 
-def lookup(m):
-    out = dict(m, found=False)
+def tmdb(path, **params):
+    """GET from TMDB; accepts either a v3 API key or a v4 read-access token."""
+    req = urllib.request.Request("https://api.themoviedb.org/3" + path + "?" + urllib.parse.urlencode(params))
+    if len(TMDB) > 40:
+        req.add_header("Authorization", "Bearer " + TMDB)
+    else:
+        req = urllib.request.Request(req.full_url + "&api_key=" + TMDB)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def tmdb_score(d):
+    """TMDB user rating as a string like "7.8", or "" when nobody has voted."""
+    return f"{d['vote_average']:.1f}" if d.get("vote_count") else ""
+
+
+def backfill_au(m):
+    """Add the Australian classification (m["au"], "" if none) via TMDB, by IMDb id."""
     try:
-        def q(**kw):
-            kw.update(apikey=OMDB, type="movie", plot="short")
-            return get("https://www.omdbapi.com/?" + urllib.parse.urlencode(kw))
-        o = q(t=m["title"], y=m["year"]) if m["year"] else q(t=m["title"])
-        if o.get("Response") == "False" and m["year"]:  # year in filename may be off
-            o = q(t=m["title"])
-        if o.get("Response") == "False":
-            hits = q(s=m["title"]).get("Search")
-            o = q(i=hits[0]["imdbID"]) if hits else o
-        if o.get("Response") == "False":
+        found = tmdb(f"/find/{m['imdb_id']}", external_source="imdb_id")["movie_results"]
+        au = ""
+        if found:
+            m["tmdb"] = tmdb_score(found[0])
+            for c in tmdb(f"/movie/{found[0]['id']}/release_dates")["results"]:
+                if c["iso_3166_1"] == "AU":
+                    au = next((d["certification"] for d in c["release_dates"] if d["certification"]), "")
+        m["au"] = au
+        m.setdefault("tmdb", "")
+    except Exception:
+        pass  # left unset, retried next run
+    return m
+
+
+def tmdb_lookup(m):
+    """Look up a movie on TMDB alone (no IMDb/RT scores; those are backfilled from OMDb later)."""
+    out = dict(m, found=False, tried=True)
+    lang = "zh-CN" if CJK.search(m["title"]) else "en-US"
+    ov = m.get("ov") or {}
+    if ov.get("tmdb"):
+        return tmdb_details(out, ov["tmdb"], lang)
+    if ov.get("imdb"):
+        res = tmdb(f"/find/{ov['imdb']}", external_source="imdb_id")["movie_results"]
+        return tmdb_details(out, res[0]["id"], lang) if res else out
+    q = {"query": m["title"], "language": lang}
+    if m["year"]:
+        q["year"] = m["year"]
+    res = tmdb("/search/movie", **q)["results"]
+    if not res and m["year"]:
+        q.pop("year")
+        res = tmdb("/search/movie", **q)["results"]
+    return tmdb_details(out, res[0]["id"], lang) if res else out
+
+
+def tmdb_details(out, tid, lang):
+    d = tmdb(f"/movie/{tid}", append_to_response="release_dates", language=lang)
+    if not d.get("overview"):  # no Chinese synopsis: fall back to English
+        d["overview"] = tmdb(f"/movie/{tid}", language="en-US").get("overview", "")
+    au = ""
+    for c in d.get("release_dates", {}).get("results", []):
+        if c["iso_3166_1"] == "AU":
+            au = next((x["certification"] for x in c["release_dates"] if x["certification"]), "")
+    out.update(
+        found=True, src="tmdb", scored=False,
+        name=d["title"],
+        year=(d.get("release_date") or "")[:4],
+        released=d.get("release_date") or None,
+        overview=d.get("overview", ""),
+        poster=d.get("poster_path") and "https://image.tmdb.org/t/p/w342" + d["poster_path"],
+        genres=[g["name"] for g in d.get("genres", [])],
+        runtime=str(d["runtime"]) if d.get("runtime") else None,
+        imdb_id=d.get("imdb_id") or None,
+        imdb=None, rt=None, au=au, tmdb=tmdb_score(d),
+    )
+    return out
+
+
+OMDB_DOWN = False
+
+
+def backfill_scores(m):
+    """Add IMDb/RT scores to a TMDB-sourced entry, by IMDb id. Stops trying once OMDb's daily limit is hit."""
+    global OMDB_DOWN
+    if OMDB_DOWN:
+        return m
+    try:
+        o = get(f"https://www.omdbapi.com/?apikey={OMDB}&i={m['imdb_id']}")
+        m["imdb"] = None if o.get("imdbRating", "N/A") == "N/A" else o["imdbRating"]
+        m["rt"] = next((r["Value"] for r in o.get("Ratings", []) if r["Source"] == "Rotten Tomatoes"), None)
+        m["scored"] = True
+    except urllib.error.HTTPError as ex:
+        OMDB_DOWN = OMDB_DOWN or ex.code == 401
+    except Exception:
+        pass
+    return m
+
+
+def lookup(m):
+    global OMDB_DOWN
+    ov = m.get("ov") or {}
+    if (CJK.search(m["title"]) or ov.get("tmdb") or ov.get("imdb")) and TMDB:  # OMDb can't search Chinese titles
+        try:
+            out = tmdb_lookup(m)
+            if not out["found"]:  # bilingual name, e.g. "功夫熊猫1-3D.Kung.Fu.Panda.1.3D...": retry on the English part
+                en = re.sub(r"\[cnliti\]|[^\x00-\x7f]+", " ", m["path"].split("/")[-1])
+                title, year = parse_name(en.replace("-3D", " "))
+                if title and not CJK.search(title):
+                    out = dict(tmdb_lookup(dict(m, title=title, year=year or m["year"])), title=m["title"], year=m["year"])
             return out
-        na = lambda v: None if v in (None, "N/A") else v
-        rt = next((r["Value"] for r in o.get("Ratings", []) if r["Source"] == "Rotten Tomatoes"), None)
-        out.update(
-            found=True,
-            name=o["Title"],
-            year=(na(o.get("Year")) or "")[:4],
-            overview=na(o.get("Plot")) or "",
-            poster=na(o.get("Poster")),
-            genres=(na(o.get("Genre")) or "").split(", ") if na(o.get("Genre")) else [],
-            runtime=(na(o.get("Runtime")) or "").replace(" min", "") or None,
-            imdb_id=o.get("imdbID"),
-            released=iso_date(o.get("Released")),
-            imdb=na(o.get("imdbRating")),
-            rt=rt,
-        )
+        except Exception as ex:
+            return dict(m, found=False, error=str(ex))
+    try:
+        if not OMDB_DOWN:
+            out = omdb_lookup(m)
+            if out.get("found") or not TMDB:
+                return out
     except Exception as ex:
-        out["error"] = str(ex)
+        OMDB_DOWN = OMDB_DOWN or getattr(ex, "code", None) == 401
+        if not TMDB:
+            return dict(m, found=False, error=str(ex))
+    try:  # OMDb failed (daily limit, or no match): try TMDB
+        return tmdb_lookup(m)
+    except Exception as ex:
+        return dict(m, found=False, error=str(ex))
+
+
+def omdb_lookup(m):
+    out = dict(m, found=False)
+    def q(**kw):
+        kw.update(apikey=OMDB, type="movie", plot="short")
+        return get("https://www.omdbapi.com/?" + urllib.parse.urlencode(kw))
+    o = q(t=m["title"], y=m["year"]) if m["year"] else q(t=m["title"])
+    if o.get("Response") == "False" and m["year"]:  # year in filename may be off
+        o = q(t=m["title"])
+    if o.get("Response") == "False":
+        hits = q(s=m["title"]).get("Search")
+        o = q(i=hits[0]["imdbID"]) if hits else o
+    if o.get("Response") == "False":
+        return out
+    na = lambda v: None if v in (None, "N/A") else v
+    rt = next((r["Value"] for r in o.get("Ratings", []) if r["Source"] == "Rotten Tomatoes"), None)
+    out.update(
+        found=True,
+        name=o["Title"],
+        year=(na(o.get("Year")) or "")[:4],
+        overview=na(o.get("Plot")) or "",
+        poster=na(o.get("Poster")),
+        genres=(na(o.get("Genre")) or "").split(", ") if na(o.get("Genre")) else [],
+        runtime=(na(o.get("Runtime")) or "").replace(" min", "") or None,
+        imdb_id=o.get("imdbID"),
+        released=iso_date(o.get("Released")),
+        imdb=na(o.get("imdbRating")),
+        rt=rt,
+    )
     return out
 
 
 def link(m):
-    return "file://" + urllib.parse.quote(str(ROOT / m["path"]))
+    return "file://" + urllib.parse.quote(str(ROOTS[0].parent / m["path"]))
 
 
 def card(m):
@@ -140,11 +308,18 @@ def card(m):
         badges += f'<a class="b imdb" href="https://www.imdb.com/title/{m["imdb_id"]}/" target="_blank">IMDb {m["imdb"]}</a>'
     if m.get("rt"):
         badges += f'<span class="b rt">🍅 {m["rt"]}</span>'
-    meta = " · ".join(filter(None, [m.get("released") or m["year"], f'{m["runtime"]} min' if m.get("runtime") else "", ", ".join(m["genres"][:3])]))
+    if m.get("tmdb"):
+        badges += f'<span class="b tm" title="TMDB user score">TMDB {m["tmdb"]}</span>'
+    if m.get("au"):
+        badges += f'<span class="b au" title="Australian classification">{html.escape(m["au"].replace(" ", ""))}</span>'
+    rt_min = int(m["runtime"]) if str(m.get("runtime") or "").isdigit() else None
+    runtime = f"⏱ {rt_min // 60}h {rt_min % 60:02d}m" if rt_min and rt_min >= 60 else f"⏱ {rt_min} min" if rt_min else ""
+    meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime]))
+    genres = "".join(f'<span class="g">{html.escape(g)}</span>' for g in m["genres"])
     return (f'<div class="card" data-t="{html.escape(m["name"].lower())}" data-imdb="{m.get("imdb") or 0}" '
-            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-y="{m["year"]}" data-d="{m.get("released") or m["year"] + "-00-00"}">'
+            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{m["year"]}" data-d="{m.get("released") or m["year"] + "-00-00"}">'
             f'<a class="poster" href="{link(m)}" target="_blank" title="Open folder">{poster}</a><div class="body"><h2>{html.escape(m["name"])}</h2>'
-            f'<p class="meta">{html.escape(meta)}</p><div class="badges">{badges}</div>'
+            f'<p class="meta">{html.escape(meta)}</p><div class="genres">{genres}</div><div class="badges">{badges}</div>'
             f'<p class="intro">{html.escape(m["overview"])}</p>'
             f'<p class="path">{html.escape(m["path"])}</p></div></div>')
 
@@ -161,12 +336,12 @@ main{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:
 .poster{display:block;flex:0 0 240px;min-height:360px;background:#0002}.poster img{width:240px;height:100%;object-fit:cover;display:block}
 .body{padding:12px 12px 12px 0;min-width:0}h2{margin:0;font-size:17px}.meta,.path{margin:2px 0;color:var(--mut);font-size:13px}
 .path{font-size:11px;word-break:break-all}.intro{margin:8px 0;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
-.badges{display:flex;gap:6px;margin-top:6px}.b{font-size:12px;font-weight:600;padding:2px 8px;border-radius:5px;text-decoration:none}
-.imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.miss{opacity:.6}
+.genres{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.g{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--mut);color:var(--mut)}.badges{display:flex;gap:6px;margin-top:6px}.b{font-size:12px;font-weight:600;padding:2px 8px;border-radius:5px;text-decoration:none}
+.imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.tm{background:#0369a1;color:#fff}.au{background:#0b6e4f;color:#fff}.miss{opacity:.6}
 @media(max-width:600px){main{grid-template-columns:1fr}.poster,.poster img{flex-basis:150px;width:150px}}
 </style>
 <header><h1>Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
-<option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option></select><select id="yr"></select></header>
+<option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select></header>
 <main id="m">__CARDS__</main>
 <script>
 const m=document.getElementById('m'),cards=[...m.children];
@@ -183,11 +358,15 @@ q.oninput=s.onchange=yr.onchange=go;go();
 def main():
     if not OMDB:
         sys.exit("Set OMDB_API_KEY in env or .env")
-    if not ROOT.is_dir():
-        sys.exit(f"{ROOT} not found - is the NAS mounted?")
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
+    # older caches keyed paths relative to /Volumes/movies
+    if any(not k.startswith(("movies/", "movies-2T/")) for k in cache):
+        cache = {("movies/" + k): dict(v, path="movies/" + v["path"]) for k, v in cache.items()}
     movies = scan()
-    todo = [m for m in movies if m["path"] not in cache or not cache[m["path"]].get("found") and "error" in cache[m["path"]]]
+    todo = [m for m in movies if m["path"] not in cache
+            or not cache[m["path"]].get("found") and ("error" in cache[m["path"]] or cache[m["path"]]["title"] != m["title"]
+                                                     or TMDB and not cache[m["path"]].get("tried"))
+            or cache[m["path"]].get("ov") != m.get("ov")]
     print(f"{len(movies)} entries, {len(todo)} to look up")
     with ThreadPoolExecutor(8) as ex:
         for i, r in enumerate(ex.map(lookup, todo), 1):
@@ -199,6 +378,19 @@ def main():
         print(f"adding release dates to {len(old)} cached movies")
         with ThreadPoolExecutor(8) as ex:
             list(ex.map(backfill_date, old))
+    todo_scores = [c for c in cache.values() if c.get("src") == "tmdb" and c.get("imdb_id") and not c.get("scored")]
+    if todo_scores and OMDB:
+        print(f"adding IMDb/RT scores to {len(todo_scores)} TMDB-sourced movies")
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(backfill_scores, todo_scores))
+        if OMDB_DOWN:
+            print("  OMDb daily limit reached; scores will be added on a later run")
+    if TMDB:
+        need = [c for c in cache.values() if c.get("imdb_id") and ("au" not in c or "tmdb" not in c)]
+        if need:
+            print(f"adding Australian classification and TMDB score to {len(need)} movies")
+            with ThreadPoolExecutor(8) as ex:
+                list(ex.map(backfill_au, need))
     CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
     rows = [cache[m["path"]] for m in movies]
     rows.sort(key=lambda r: (r.get("name") or r["title"]).lower())
