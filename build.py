@@ -12,7 +12,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 ROOTS = [Path(p) for p in sys.argv[1:]] or [Path("/Volumes/movies"), Path("/Volumes/movies-2T")]
-SKIP_DIRS = {"TV", "tmp", "TVseries", "upload", "4k"}
+SKIP_DIRS = {"TV", "tmp", "TVseries", "upload", "4k", "movie-catalog"}
 VIDEO = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
 CACHE = HERE / "cache.json"
 OVERRIDES = json.loads((HERE / "overrides.json").read_text()) if (HERE / "overrides.json").exists() else {}
@@ -395,7 +395,10 @@ def main():
     rows = [cache[m["path"]] for m in movies]
     rows.sort(key=lambda r: (r.get("name") or r["title"]).lower())
     (HERE / "movies.html").write_text(PAGE.replace("__N__", str(len(rows))).replace("__CARDS__", "".join(map(card, rows))))
-    print(f"unmatched: {sum(not r.get('found') for r in rows)}  -> {HERE/'movies.html'}")
+    misses = [r for r in rows if not r.get("found")]
+    print(f"unmatched: {len(misses)}  -> {HERE/'movies.html'}")
+    for m in misses:
+        print(f"  {m['path']}")
 
 
 if __name__ == "__main__":
