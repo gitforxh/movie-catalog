@@ -360,9 +360,12 @@ def card(m):
     runtime = f"⏱ {rt_min // 60}h {rt_min % 60:02d}m" if rt_min and rt_min >= 60 else f"⏱ {rt_min} min" if rt_min else ""
     meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime, m.get("country")]))
     genres = "".join(f'<span class="g">{html.escape(g)}</span>' for g in m["genres"])
+    # A discover-only entry (no NAS path) gets a "Not in library" ribbon, so it reads clearly as a
+    # suggestion rather than something you already own.
+    badge_html = "" if m.get("path") else '<span class="discover-badge">Not in library</span>'
     return (f'<div class="card" data-t="{html.escape(m["name"].lower())}" data-imdb="{m.get("imdb") or 0}" '
             f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{m["year"]}" data-d="{m.get("released") or m["year"] + "-00-00"}">'
-            f'{poster_tag}<div class="body"><h2>{html.escape(m["name"])}</h2>'
+            f'{poster_tag}<div class="body">{badge_html}<h2>{html.escape(m["name"])}</h2>'
             f'<p class="meta">{html.escape(meta)}</p><div class="genres">{genres}</div><div class="badges">{badges}</div>'
             f'<p class="intro">{html.escape(m["overview"])}</p>'
             + (f'<p class="path">{html.escape(m["path"])}</p>' if m.get("path") else "") + '</div></div>')
@@ -378,13 +381,17 @@ header h1{font-size:18px;margin:0 8px 0 0}input,select{padding:6px 10px;font:inh
 main,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:16px;padding:16px}
 .card{display:flex;gap:14px;background:var(--card);border-radius:10px;overflow:hidden}
 .poster{display:block;flex:0 0 240px;min-height:360px;background:#0002}.poster img{width:240px;height:100%;object-fit:cover;display:block}
-.body{padding:12px 12px 12px 0;min-width:0}h2{margin:0;font-size:17px}.meta,.path{margin:2px 0;color:var(--mut);font-size:13px}
+.body{padding:12px 12px 12px 0;min-width:0;position:relative}h2{margin:0;font-size:17px}.meta,.path{margin:2px 0;color:var(--mut);font-size:13px}
 .path{font-size:11px;word-break:break-all}.intro{margin:8px 0;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .genres{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.g{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--mut);color:var(--mut)}.badges{display:flex;gap:6px;margin-top:6px}.b{font-size:12px;font-weight:600;padding:2px 8px;border-radius:5px;text-decoration:none}
 .imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.tm{background:#0369a1;color:#fff}.au{background:#0b6e4f;color:#fff}.miss{opacity:.6}
 @media(max-width:600px){main,.grid{grid-template-columns:1fr}.poster,.poster img{flex-basis:150px;width:150px}}
-#disc{display:none}#disc h3{margin:0;padding:20px 16px 0;font-size:42px;color:var(--mut);font-weight:600}
+#disc{display:none;margin-top:20px}
+#disc h3{margin:0;padding:20px 16px;font-size:48px;color:var(--fg);font-weight:700;background:#7c3aed88}
 #disc .grid{display:none}
+.discover-badge{position:absolute;top:8px;right:12px;background:#7c3aed;color:#fff;font-size:10px;font-weight:700;
+  padding:2px 8px;border-radius:10px;letter-spacing:.03em}
+.body:has(.discover-badge) h2{padding-right:88px}
 </style>
 <header><h1>Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
 <option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select></header>
