@@ -3,3 +3,4 @@ __pycache__/
 cache.json
 movies.html
 overrides.json
+discover_cache.json

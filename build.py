@@ -15,6 +15,7 @@ ROOTS = [Path(p) for p in sys.argv[1:]] or [Path("/Volumes/movies"), Path("/Volu
 SKIP_DIRS = {"TV", "tmp", "TVseries", "upload", "4k", "movie-catalog"}
 VIDEO = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
 CACHE = HERE / "cache.json"
+DISCOVER_CACHE = HERE / "discover_cache.json"
 OVERRIDES = json.loads((HERE / "overrides.json").read_text()) if (HERE / "overrides.json").exists() else {}
 
 
@@ -113,7 +114,10 @@ def scan():
                             continue
                         if ov:
                             title, year = ov.get("title", title), ov.get("year", year)
-                        found[p] = {"title": title, "year": year, "path": p, "ov": ov}
+                        # tmdb_lookup/omdb_lookup store a found movie's year as a string (from a
+                        # release date), so an unmatched one needs to match that type too - otherwise
+                        # a mix of str and int years in the final rows breaks sorting them later.
+                        found[p] = {"title": title, "year": str(year) if year is not None else None, "path": p, "ov": ov}
     return list(found.values())
 
 
@@ -154,18 +158,34 @@ def tmdb_score(d):
     return f"{d['vote_average']:.1f}" if d.get("vote_count") else ""
 
 
+def countries_of(d):
+    return ", ".join(c["name"] for c in d.get("production_countries", []))
+
+
 def backfill_au(m):
-    """Add the Australian classification (m["au"], "" if none) via TMDB, by IMDb id."""
+    """Add the Australian classification, country and TMDB id/score via TMDB, by IMDb id (or a cached TMDB id).
+    Reuses m["_tmdb"], the raw TMDB response saved on every lookup, so adding another field later from the
+    same data (e.g. a new badge) needs no new API calls - just a re-run to re-derive it from the cache."""
     try:
-        found = tmdb(f"/find/{m['imdb_id']}", external_source="imdb_id")["movie_results"]
+        tid = m.get("tmdb_id")
+        d = m.get("_tmdb")
+        if not tid:
+            found = tmdb(f"/find/{m['imdb_id']}", external_source="imdb_id")["movie_results"]
+            if not found:
+                m.setdefault("au", ""), m.setdefault("tmdb", ""), m.setdefault("country", "")
+                return m
+            tid, m["tmdb"] = found[0]["id"], tmdb_score(found[0])
+            m["tmdb_id"] = tid
+        if not d:
+            d = tmdb(f"/movie/{tid}", append_to_response="release_dates")
+            m["_tmdb"] = d
         au = ""
-        if found:
-            m["tmdb"] = tmdb_score(found[0])
-            for c in tmdb(f"/movie/{found[0]['id']}/release_dates")["results"]:
-                if c["iso_3166_1"] == "AU":
-                    au = next((d["certification"] for d in c["release_dates"] if d["certification"]), "")
+        for c in d.get("release_dates", {}).get("results", []):
+            if c["iso_3166_1"] == "AU":
+                au = next((x["certification"] for x in c["release_dates"] if x["certification"]), "")
         m["au"] = au
-        m.setdefault("tmdb", "")
+        m["country"] = countries_of(d)
+        m.setdefault("tmdb", tmdb_score(d))
     except Exception:
         pass  # left unset, retried next run
     return m
@@ -209,7 +229,8 @@ def tmdb_details(out, tid, lang):
         genres=[g["name"] for g in d.get("genres", [])],
         runtime=str(d["runtime"]) if d.get("runtime") else None,
         imdb_id=d.get("imdb_id") or None,
-        imdb=None, rt=None, au=au, tmdb=tmdb_score(d),
+        imdb=None, rt=None, au=au, tmdb=tmdb_score(d), tmdb_id=tid, country=countries_of(d),
+        _tmdb=d,  # raw TMDB response, kept so a future new field can be read from cache with no new API call
     )
     return out
 
@@ -290,6 +311,7 @@ def omdb_lookup(m):
         released=iso_date(o.get("Released")),
         imdb=na(o.get("imdbRating")),
         rt=rt,
+        country=na(o.get("Country")) or "",
     )
     return out
 
@@ -303,25 +325,28 @@ def card(m):
         return (f'<div class="card miss"><a class="poster" href="{link(m)}" target="_blank"></a><div class="body"><h2>{html.escape(m["title"])}</h2>'
                 f'<p class="meta">No match found</p><p class="meta">{html.escape(m["path"])}</p></div></div>')
     poster = f'<img loading="lazy" src="{m["poster"]}" alt="">' if m.get("poster") else ""
+    poster_tag = (f'<a class="poster" href="{link(m)}" target="_blank" title="Open folder">{poster}</a>' if m.get("path")
+                  else f'<div class="poster">{poster}</div>')
     badges = ""
     if m.get("imdb"):
         badges += f'<a class="b imdb" href="https://www.imdb.com/title/{m["imdb_id"]}/" target="_blank">IMDb {m["imdb"]}</a>'
     if m.get("rt"):
         badges += f'<span class="b rt">🍅 {m["rt"]}</span>'
     if m.get("tmdb"):
-        badges += f'<span class="b tm" title="TMDB user score">TMDB {m["tmdb"]}</span>'
+        badges += (f'<a class="b tm" href="https://www.themoviedb.org/movie/{m["tmdb_id"]}" target="_blank" title="View on TMDB">TMDB {m["tmdb"]}</a>'
+                   if m.get("tmdb_id") else f'<span class="b tm" title="TMDB user score">TMDB {m["tmdb"]}</span>')
     if m.get("au"):
         badges += f'<span class="b au" title="Australian classification">{html.escape(m["au"].replace(" ", ""))}</span>'
     rt_min = int(m["runtime"]) if str(m.get("runtime") or "").isdigit() else None
     runtime = f"⏱ {rt_min // 60}h {rt_min % 60:02d}m" if rt_min and rt_min >= 60 else f"⏱ {rt_min} min" if rt_min else ""
-    meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime]))
+    meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime, m.get("country")]))
     genres = "".join(f'<span class="g">{html.escape(g)}</span>' for g in m["genres"])
     return (f'<div class="card" data-t="{html.escape(m["name"].lower())}" data-imdb="{m.get("imdb") or 0}" '
             f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{m["year"]}" data-d="{m.get("released") or m["year"] + "-00-00"}">'
-            f'<a class="poster" href="{link(m)}" target="_blank" title="Open folder">{poster}</a><div class="body"><h2>{html.escape(m["name"])}</h2>'
+            f'{poster_tag}<div class="body"><h2>{html.escape(m["name"])}</h2>'
             f'<p class="meta">{html.escape(meta)}</p><div class="genres">{genres}</div><div class="badges">{badges}</div>'
             f'<p class="intro">{html.escape(m["overview"])}</p>'
-            f'<p class="path">{html.escape(m["path"])}</p></div></div>')
+            + (f'<p class="path">{html.escape(m["path"])}</p>' if m.get("path") else "") + '</div></div>')
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -331,28 +356,96 @@ PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="wi
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
 header{position:sticky;top:0;background:var(--bg);padding:12px 16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;z-index:1;border-bottom:1px solid var(--card)}
 header h1{font-size:18px;margin:0 8px 0 0}input,select{padding:6px 10px;font:inherit;border-radius:6px;border:1px solid var(--mut);background:var(--card);color:var(--fg)}
-main{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:16px;padding:16px}
+main,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:16px;padding:16px}
 .card{display:flex;gap:14px;background:var(--card);border-radius:10px;overflow:hidden}
 .poster{display:block;flex:0 0 240px;min-height:360px;background:#0002}.poster img{width:240px;height:100%;object-fit:cover;display:block}
 .body{padding:12px 12px 12px 0;min-width:0}h2{margin:0;font-size:17px}.meta,.path{margin:2px 0;color:var(--mut);font-size:13px}
 .path{font-size:11px;word-break:break-all}.intro{margin:8px 0;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .genres{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.g{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--mut);color:var(--mut)}.badges{display:flex;gap:6px;margin-top:6px}.b{font-size:12px;font-weight:600;padding:2px 8px;border-radius:5px;text-decoration:none}
 .imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.tm{background:#0369a1;color:#fff}.au{background:#0b6e4f;color:#fff}.miss{opacity:.6}
-@media(max-width:600px){main{grid-template-columns:1fr}.poster,.poster img{flex-basis:150px;width:150px}}
+@media(max-width:600px){main,.grid{grid-template-columns:1fr}.poster,.poster img{flex-basis:150px;width:150px}}
+#disc{display:none}#disc h3{margin:0;padding:20px 16px 0;font-size:42px;color:var(--mut);font-weight:600}
+#disc .grid{display:none}
 </style>
 <header><h1>Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
 <option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select></header>
 <main id="m">__CARDS__</main>
+<div id="disc"><h3 id="discH"></h3>__DISCOVER_GRIDS__</div>
 <script>
 const m=document.getElementById('m'),cards=[...m.children];
+const discGrids=[...document.querySelectorAll('#disc .grid')];
+function renderDiscover(y){
+  const active=discGrids.find(g=>g.dataset.y===y&&g.children.length);
+  discGrids.forEach(g=>g.style.display=g===active?'grid':'none');
+  document.getElementById('disc').style.display=active?'block':'none';
+  document.getElementById('discH').textContent=`Best Movies of ${y}`;
+}
 const yr=document.getElementById('yr'),years=[...new Set(cards.map(c=>c.dataset.y).filter(Boolean))].sort().reverse();
 yr.innerHTML='<option value="">All years</option>'+years.map(y=>`<option>${y}</option>`).join('');
 const cur=String(new Date().getFullYear());yr.value=years.includes(cur)?cur:'';
 function go(){const q=document.getElementById('q').value.toLowerCase(),s=document.getElementById('s').value,y=yr.value;
 cards.forEach(c=>c.style.display=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y)?'':'none');
-[...cards].sort((a,b)=>s=='t'?(a.dataset.t||'~').localeCompare(b.dataset.t||'~'):s=='d'?(b.dataset.d||'').localeCompare(a.dataset.d||''):(+b.dataset[s]||0)-(+a.dataset[s]||0)).forEach(c=>m.appendChild(c))}
+[...cards].sort((a,b)=>s=='t'?(a.dataset.t||'~').localeCompare(b.dataset.t||'~'):s=='d'?(b.dataset.d||'').localeCompare(a.dataset.d||''):(+b.dataset[s]||0)-(+a.dataset[s]||0)).forEach(c=>m.appendChild(c));
+renderDiscover(y)}
 q.oninput=s.onchange=yr.onchange=go;go();
 </script>"""
+
+
+def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
+    """Highly rated (TMDB score > 7.5) movies for `year` that aren't already in the library.
+    Each is a full card row, same shape as a library movie, minus a NAS "path"."""
+    out, checked = [], 0
+    for page in (1, 2):
+        if len(out) >= limit or checked >= max_checked:
+            break
+        try:
+            results = tmdb("/discover/movie", primary_release_year=year, sort_by="vote_average.desc",
+                            page=page, **{"vote_count.gte": 1000})["results"]
+        except Exception:
+            break
+        for d in results:
+            if len(out) >= limit or checked >= max_checked:
+                break
+            checked += 1
+            score = tmdb_score(d)
+            if not score or float(score) <= 7.5:
+                continue
+            try:
+                row = tmdb_details({"path": None}, d["id"], "en-US")
+            except Exception:
+                continue
+            if row.get("imdb_id") in exclude_imdb_ids:
+                continue
+            out.append(row)
+    out.sort(key=lambda r: -float(r["tmdb"]))
+    return out
+
+
+def build_discover(cache, rows):
+    """{"2023": [...]} of highly rated movies per year not already in the library. Cached forever per year."""
+    if not TMDB:
+        return json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
+    dcache = json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
+    lib_imdb_ids = {c.get("imdb_id") for c in cache.values() if c.get("imdb_id")}
+    years = sorted({r["year"] for r in rows if r.get("year")}, reverse=True)[:20]
+    new_years = [y for y in years if y not in dcache]
+    if new_years:
+        print(f"finding highly rated movies for {len(new_years)} years you're missing")
+    for y in new_years:
+        dcache[y] = discover_year(int(y), lib_imdb_ids)
+    stale = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and "country" not in m]
+    if stale:  # cached before the TMDB id / country were added: fill them in (one call each, since tmdb_id is often already known)
+        print(f"adding TMDB id/country to {len(stale)} discovered movies")
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(backfill_au, stale))
+    if OMDB and not OMDB_DOWN:  # opportunistic: add the real IMDb score where we can, without blocking on it
+        unscored = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and not m.get("scored")]
+        if unscored:
+            print(f"adding IMDb scores to {len(unscored)} discovered movies")
+            with ThreadPoolExecutor(8) as ex:
+                list(ex.map(backfill_scores, unscored))
+    DISCOVER_CACHE.write_text(json.dumps(dcache, ensure_ascii=False, indent=1))
+    return dcache
 
 
 def main():
@@ -362,6 +455,12 @@ def main():
     # older caches keyed paths relative to /Volumes/movies
     if any(not k.startswith(("movies/", "movies-2T/")) for k in cache):
         cache = {("movies/" + k): dict(v, path="movies/" + v["path"]) for k, v in cache.items()}
+    # older caches may have "year" as a JSON number instead of a string (from before scan()/
+    # tmdb_lookup/omdb_lookup were made consistent about it) - fix those in place so build_discover's
+    # sort() of years doesn't fail comparing a mix of str and int.
+    for v in cache.values():
+        if isinstance(v.get("year"), int):
+            v["year"] = str(v["year"])
     movies = scan()
     todo = [m for m in movies if m["path"] not in cache
             or not cache[m["path"]].get("found") and ("error" in cache[m["path"]] or cache[m["path"]]["title"] != m["title"]
@@ -386,7 +485,7 @@ def main():
         if OMDB_DOWN:
             print("  OMDb daily limit reached; scores will be added on a later run")
     if TMDB:
-        need = [c for c in cache.values() if c.get("imdb_id") and ("au" not in c or "tmdb" not in c)]
+        need = [c for c in cache.values() if c.get("imdb_id") and ("au" not in c or "tmdb" not in c or "tmdb_id" not in c or "country" not in c)]
         if need:
             print(f"adding Australian classification and TMDB score to {len(need)} movies")
             with ThreadPoolExecutor(8) as ex:
@@ -394,11 +493,39 @@ def main():
     CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
     rows = [cache[m["path"]] for m in movies]
     rows.sort(key=lambda r: (r.get("name") or r["title"]).lower())
-    (HERE / "movies.html").write_text(PAGE.replace("__N__", str(len(rows))).replace("__CARDS__", "".join(map(card, rows))))
+    discover = build_discover(cache, rows)
+    disc_grids = "".join(f'<div class="grid" data-y="{html.escape(y)}">{"".join(map(card, movies))}</div>'
+                          for y, movies in discover.items())
+    (HERE / "movies.html").write_text(PAGE.replace("__N__", str(len(rows)))
+                                       .replace("__CARDS__", "".join(map(card, rows)))
+                                       .replace("__DISCOVER_GRIDS__", disc_grids))
+    write_json(rows, discover)
     misses = [r for r in rows if not r.get("found")]
     print(f"unmatched: {len(misses)}  -> {HERE/'movies.html'}")
     for m in misses:
         print(f"  {m['path']}")
+
+
+def slim(m):
+    """A movie row without the internal/heavy fields (_tmdb, ov) - for movies.json, read by the Android TV app."""
+    return {k: v for k, v in m.items() if k not in ("_tmdb", "ov", "error", "tried", "scored", "src")}
+
+
+def write_json(rows, discover):
+    """movies.json: same data as movies.html, for the Android TV app. Also dropped into each NAS root's
+    movie-catalog/ folder (if present) so the app can read it over SMB, the same way it reads video files."""
+    catalog = {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "movies": [slim(r) for r in rows if r.get("found")],
+        "discover": {y: [slim(m) for m in ms] for y, ms in discover.items()},
+    }
+    data = json.dumps(catalog, ensure_ascii=False)
+    (HERE / "movies.json").write_text(data)
+    for root in ROOTS:
+        dest = root / "movie-catalog" / "movies.json"
+        if dest.parent.is_dir():
+            dest.write_text(data)
+            print(f"  copied movies.json -> {dest}")
 
 
 if __name__ == "__main__":
