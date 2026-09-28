@@ -255,9 +255,28 @@ def backfill_scores(m):
     return m
 
 
+def manual_entry(m, ov):
+    """A fully hand-entered row, for a title that has no matching entry in TMDB's *movie* database at
+    all - e.g. a TV special/episode released under its own IMDb id, which TMDB's /find only resolves
+    against tv_results, not movie_results, so the usual {"imdb": "tt..."} override never matches
+    anything. {"manual": true, "overview": "...", "poster": "https://...", "genres": [...],
+    "runtime": "60", "released": "2022-01-01", "imdb": "tt...", ...} in overrides.json skips any
+    OMDb/TMDB lookup and uses exactly what's given, defaulting anything left out."""
+    return dict(
+        m, found=True, tried=True, src="manual", scored=True,
+        name=m["title"], overview=ov.get("overview", ""), poster=ov.get("poster"),
+        genres=ov.get("genres", []), runtime=ov.get("runtime"), released=ov.get("released"),
+        imdb_id=ov.get("imdb"), imdb=ov.get("imdb_score"), rt=ov.get("rt"),
+        au=ov.get("au", ""), tmdb=ov.get("tmdb_score"), tmdb_id=ov.get("tmdb_id"),
+        country=ov.get("country", ""),
+    )
+
+
 def lookup(m):
     global OMDB_DOWN
     ov = m.get("ov") or {}
+    if ov.get("manual"):
+        return manual_entry(m, ov)
     if (CJK.search(m["title"]) or ov.get("tmdb") or ov.get("imdb")) and TMDB:  # OMDb can't search Chinese titles
         try:
             out = tmdb_lookup(m)
@@ -387,7 +406,12 @@ function go(){const q=document.getElementById('q').value.toLowerCase(),s=documen
 cards.forEach(c=>c.style.display=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y)?'':'none');
 [...cards].sort((a,b)=>s=='t'?(a.dataset.t||'~').localeCompare(b.dataset.t||'~'):s=='d'?(b.dataset.d||'').localeCompare(a.dataset.d||''):(+b.dataset[s]||0)-(+a.dataset[s]||0)).forEach(c=>m.appendChild(c));
 renderDiscover(y)}
-q.oninput=s.onchange=yr.onchange=go;go();
+// Searching for a specific movie shouldn't also require remembering to switch to "All years" first,
+// and picking a year is a fresh browse that shouldn't still be narrowed by an old search term.
+const qInput=document.getElementById('q');
+qInput.oninput=()=>{if(qInput.value)yr.value='';go()};
+yr.onchange=()=>{if(qInput.value)qInput.value='';go()};
+s.onchange=go;go();
 </script>"""
 
 
