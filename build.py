@@ -510,7 +510,11 @@ def build_discover(cache, rows):
             with ThreadPoolExecutor(8) as ex:
                 list(ex.map(backfill_scores, unscored))
     DISCOVER_CACHE.write_text(json.dumps(dcache, ensure_ascii=False, indent=1))
-    return dcache
+    # dcache on disk keeps every movie ever discovered, even ones you've since added to the library -
+    # so if one is later removed from the library again, it reappears here instead of needing a
+    # rebuild of the whole (rate-limited) discover cache. Only what's actually shown/exported is
+    # filtered against the *current* library, fresh on every run.
+    return {y: [m for m in ms if m.get("imdb_id") not in lib_imdb_ids] for y, ms in dcache.items()}
 
 
 def abs_path_for(catalog_path):
