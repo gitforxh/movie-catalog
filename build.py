@@ -360,15 +360,19 @@ def card(m):
         badges += f'<span class="b au" title="Australian classification">{html.escape(m["au"].replace(" ", ""))}</span>'
     if m.get("has_sub"):
         badges += '<span class="b sub" title="Chinese subtitle available">SUB</span>'
+    # Falls back to the release date's year, and finally "" - never None, which Python would
+    # otherwise interpolate into the HTML below as the literal text "None", which the year filter
+    # dropdown would then offer as if it were a real year.
+    year = m.get("year") or (m.get("released") or "")[:4] or ""
     rt_min = int(m["runtime"]) if str(m.get("runtime") or "").isdigit() else None
     runtime = f"⏱ {rt_min // 60}h {rt_min % 60:02d}m" if rt_min and rt_min >= 60 else f"⏱ {rt_min} min" if rt_min else ""
-    meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime, m.get("country")]))
+    meta = " · ".join(filter(None, [m.get("released") or year, runtime, m.get("country")]))
     genres = "".join(f'<span class="g">{html.escape(g)}</span>' for g in m["genres"])
     # A discover-only entry (no NAS path) gets a "Not in library" ribbon, so it reads clearly as a
     # suggestion rather than something you already own.
     badge_html = "" if m.get("path") else '<span class="discover-badge">Not in library</span>'
     return (f'<div class="card" data-t="{html.escape(m["name"].lower())}" data-imdb="{m.get("imdb") or 0}" '
-            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{m["year"]}" data-d="{m.get("released") or m["year"] + "-00-00"}">'
+            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{year}" data-d="{m.get("released") or year + "-00-00"}">'
             f'{poster_tag}<div class="body">{badge_html}<h2>{html.escape(m["name"])}</h2>'
             f'<p class="meta">{html.escape(meta)}</p><div class="genres">{genres}</div><div class="badges">{badges}</div>'
             f'<p class="intro">{html.escape(m["overview"])}</p>'
@@ -397,7 +401,7 @@ main,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr)
   padding:2px 8px;border-radius:10px;letter-spacing:.03em}
 .body:has(.discover-badge) h2{padding-right:88px}
 </style>
-<header><h1>Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
+<header><h1 id="count">Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
 <option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select></header>
 <main id="m">__CARDS__</main>
 <div id="disc"><h3 id="discH"></h3>__DISCOVER_GRIDS__</div>
@@ -414,8 +418,10 @@ const yr=document.getElementById('yr'),years=[...new Set(cards.map(c=>c.dataset.
 yr.innerHTML='<option value="">All years</option>'+years.map(y=>`<option>${y}</option>`).join('');
 const cur=String(new Date().getFullYear());yr.value=years.includes(cur)?cur:'';
 function go(){const q=document.getElementById('q').value.toLowerCase(),s=document.getElementById('s').value,y=yr.value;
-cards.forEach(c=>c.style.display=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y)?'':'none');
+let shown=0;
+cards.forEach(c=>{const visible=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y);c.style.display=visible?'':'none';if(visible)shown++});
 [...cards].sort((a,b)=>s=='t'?(a.dataset.t||'~').localeCompare(b.dataset.t||'~'):s=='d'?(b.dataset.d||'').localeCompare(a.dataset.d||''):(+b.dataset[s]||0)-(+a.dataset[s]||0)).forEach(c=>m.appendChild(c));
+document.getElementById('count').textContent=shown===cards.length?`Movies (${cards.length})`:`Movies (${shown} of ${cards.length})`;
 renderDiscover(y)}
 // Searching for a specific movie shouldn't also require remembering to switch to "All years" first,
 // and picking a year is a fresh browse that shouldn't still be narrowed by an old search term.
@@ -645,6 +651,12 @@ def main():
     for v in cache.values():
         if isinstance(v.get("year"), int):
             v["year"] = str(v["year"])
+    # even older cache entries have "year": null despite having a real "released" date (from before
+    # tmdb_details/omdb_lookup always set it) - card()'s data-y ends up with the literal text "None"
+    # for these, which the year filter dropdown then shows as a bogus selectable "year" of its own.
+    for v in cache.values():
+        if not v.get("year") and v.get("released"):
+            v["year"] = v["released"][:4]
     movies = scan()
     todo = [m for m in movies if m["path"] not in cache
             or not cache[m["path"]].get("found") and ("error" in cache[m["path"]] or cache[m["path"]]["title"] != m["title"]
