@@ -7,14 +7,16 @@ No server and no dependencies: one Python script that uses only the standard lib
 ## Setup
 
 1. Python 3.8 or newer.
-2. Get two free API keys:
+2. Get two free API keys, and optionally a third:
    - **OMDb**: <https://www.omdbapi.com/apikey.aspx> (IMDb and Rotten Tomatoes scores, posters, summaries)
    - **TMDB**: <https://www.themoviedb.org/settings/api> (fallback matching, Chinese titles, TMDB score, Australian classification)
+   - **OpenSubtitles** (optional): <https://www.opensubtitles.com/en/consumers> (Chinese subtitles for this year's movies that don't have one yet - see below)
 3. Put the keys in a `.env` file next to `build.py`:
 
    ```
    OMDB_API_KEY=your_omdb_key
    TMDB_API_KEY=your_tmdb_key
+   OPENSUBTITLES_API_KEY=your_opensubtitles_key
    ```
 
    `.env` is git-ignored. Either a TMDB v3 API key or a v4 read-access token works.
@@ -28,6 +30,10 @@ open movies.html
 ```
 
 Run it again whenever you add movies or edit `overrides.json`. Lookups are cached in `cache.json`, so a re-run only fetches what's new or changed.
+
+## Chinese subtitles for this year's movies
+
+With `OPENSUBTITLES_API_KEY` set, each run checks this year's movies for one that has no subtitle file next to it yet (older movies are assumed to already have one, so they're skipped) and downloads the most-downloaded Chinese (Simplified) subtitle for it from OpenSubtitles, saved as `<video name>.chi.srt`. OpenSubtitles' free tier has a small daily download quota; once it's used up for the day, the rest are left for a later run rather than skipped for good.
 
 The OMDb free tier allows 1,000 requests a day. If the limit is hit, the script carries on with TMDB alone and adds the IMDb and Rotten Tomatoes scores on a later run.
 

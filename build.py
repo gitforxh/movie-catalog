@@ -33,6 +33,8 @@ def load_env():
 ENV = load_env()
 OMDB = ENV.get("OMDB_API_KEY")
 TMDB = ENV.get("TMDB_API_KEY")
+OPENSUBTITLES = ENV.get("OPENSUBTITLES_API_KEY")
+SUBTITLE_EXT = {".srt", ".vtt", ".ass", ".ssa"}
 
 JUNK = re.compile(
     r"\b(3d|hsbs|half-?sbs|sbs|3dtv|hc|2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|brrip|bdrip|web-?dl|web-?rip|webrip|hdrip|hdtv|"
@@ -356,6 +358,8 @@ def card(m):
                    if m.get("tmdb_id") else f'<span class="b tm" title="TMDB user score">TMDB {m["tmdb"]}</span>')
     if m.get("au"):
         badges += f'<span class="b au" title="Australian classification">{html.escape(m["au"].replace(" ", ""))}</span>'
+    if m.get("has_sub"):
+        badges += '<span class="b sub" title="Chinese subtitle available">SUB</span>'
     rt_min = int(m["runtime"]) if str(m.get("runtime") or "").isdigit() else None
     runtime = f"⏱ {rt_min // 60}h {rt_min % 60:02d}m" if rt_min and rt_min >= 60 else f"⏱ {rt_min} min" if rt_min else ""
     meta = " · ".join(filter(None, [m.get("released") or m["year"], runtime, m.get("country")]))
@@ -384,7 +388,7 @@ main,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr)
 .body{padding:12px 12px 12px 0;min-width:0;position:relative}h2{margin:0;font-size:17px}.meta,.path{margin:2px 0;color:var(--mut);font-size:13px}
 .path{font-size:11px;word-break:break-all}.intro{margin:8px 0;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .genres{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.g{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--mut);color:var(--mut)}.badges{display:flex;gap:6px;margin-top:6px}.b{font-size:12px;font-weight:600;padding:2px 8px;border-radius:5px;text-decoration:none}
-.imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.tm{background:#0369a1;color:#fff}.au{background:#0b6e4f;color:#fff}.miss{opacity:.6}
+.imdb{background:#f5c518;color:#000}.rt{background:#fa320a;color:#fff}.tm{background:#0369a1;color:#fff}.au{background:#0b6e4f;color:#fff}.sub{background:#64748b;color:#fff}.miss{opacity:.6}
 @media(max-width:600px){main,.grid{grid-template-columns:1fr}.poster,.poster img{flex-basis:150px;width:150px}}
 #disc{display:none;margin-top:20px}
 #disc h3{margin:0;padding:20px 16px;font-size:48px;color:var(--fg);font-weight:700;background:#7c3aed88}
@@ -503,6 +507,131 @@ def build_discover(cache, rows):
     return dcache
 
 
+def abs_path_for(catalog_path):
+    """"movies/2026/Foo" -> /Volumes/movies/2026/Foo, resolved against the actual ROOTS used for this
+    run rather than assuming /Volumes, in case build.py was pointed at custom folders."""
+    root_name = catalog_path.split("/", 1)[0]
+    for root in ROOTS:
+        if root.name == root_name:
+            return root.parent / catalog_path
+    return Path("/Volumes") / catalog_path
+
+
+def video_and_dir(path):
+    """(video file, its containing dir, has its own folder) for a movie's absolute path - the video
+    is the largest video file inside if `path` is a folder, or `path` itself if it's a bare file
+    (sharing its parent folder with other movies). video is None if nothing playable is found."""
+    if path.is_dir():
+        videos = [f for f in path.iterdir() if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in VIDEO]
+        video = max(videos, key=lambda f: f.stat().st_size) if videos else None
+        return video, path, True
+    if path.is_file():
+        return path, path.parent, False
+    return None, path, False
+
+
+def has_subtitle(video, dir_path, own_folder):
+    """Whether a subtitle already sits next to `video` - anywhere in `dir_path` for a one-movie-per-
+    folder layout, or matching `video`'s own name for a bare file sharing a folder with other movies."""
+    if not dir_path.is_dir():
+        return False
+    for f in dir_path.iterdir():
+        if not f.is_file() or f.name.startswith(".") or f.suffix.lower() not in SUBTITLE_EXT:
+            continue
+        if own_folder or f.stem.startswith(video.stem):
+            return True
+    return False
+
+
+OPENSUBTITLES_DOWN = False
+
+
+def download_chinese_subtitle(imdb_id):
+    """The most-downloaded Chinese (Simplified) subtitle for an IMDb id, via the OpenSubtitles REST
+    API, as bytes - or None if there's no match, the API key is missing/exhausted, or anything else
+    goes wrong. Stops trying for the rest of this run once the API reports its quota is used up."""
+    global OPENSUBTITLES_DOWN
+    if not OPENSUBTITLES or OPENSUBTITLES_DOWN or not imdb_id:
+        return None
+    # Without an explicit Accept header, the download endpoint returns a 503 - it's the site's
+    # generic HTML error page, not an actual server error.
+    headers = {"Api-Key": OPENSUBTITLES, "User-Agent": "movie-catalog/1.0", "Content-Type": "application/json", "Accept": "application/json"}
+    numeric_id = imdb_id.lstrip("t")
+    try:
+        req = urllib.request.Request(
+            "https://api.opensubtitles.com/api/v1/subtitles?"
+            + urllib.parse.urlencode({"imdb_id": numeric_id, "languages": "zh-cn", "order_by": "download_count"}),
+            headers=headers,
+        )
+        results = json.loads(urllib.request.urlopen(req, timeout=20).read()).get("data", [])
+        if not results:
+            return None
+        files = results[0].get("attributes", {}).get("files", [])
+        if not files:
+            return None
+        file_id = files[0]["file_id"]
+        req = urllib.request.Request(
+            "https://api.opensubtitles.com/api/v1/download",
+            data=json.dumps({"file_id": file_id}).encode(),
+            headers=headers,
+            method="POST",
+        )
+        info = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        link = info.get("link")
+        if not link:
+            return None
+        # The actual file host (not the API itself) rejects the app-identifying User-Agent above with
+        # a 403 - it wants an ordinary browser-looking one.
+        file_req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
+        return urllib.request.urlopen(file_req, timeout=30).read()
+    except urllib.error.HTTPError as ex:
+        OPENSUBTITLES_DOWN = OPENSUBTITLES_DOWN or ex.code in (401, 403, 406, 429)
+        return None
+    except Exception:
+        return None
+
+
+def annotate_subtitle_flag(rows):
+    """Sets `has_sub` on every found row, for the "SUB" badge - a real filesystem check, not just
+    "did the download step above just fetch one", so it also catches subtitles you already had."""
+    for r in rows:
+        if not r.get("found") or not r.get("path"):
+            r["has_sub"] = False
+            continue
+        video, dir_path, own_folder = video_and_dir(abs_path_for(r["path"]))
+        r["has_sub"] = bool(video and has_subtitle(video, dir_path, own_folder))
+
+
+def download_missing_subtitles(rows):
+    """Chinese subtitles for this year's movies that don't already have one - old movies are assumed
+    to already have subtitles, so only the current year is worth the (rate-limited) API calls."""
+    if not OPENSUBTITLES:
+        return
+    current_year = str(datetime.now().year)
+    candidates = []
+    for r in rows:
+        if r.get("year") != current_year or not r.get("found") or not r.get("path") or not r.get("imdb_id"):
+            continue
+        video, dir_path, own_folder = video_and_dir(abs_path_for(r["path"]))
+        if video and not has_subtitle(video, dir_path, own_folder):
+            candidates.append((r, video))
+    if not candidates:
+        return
+    print(f"looking for Chinese subtitles for {len(candidates)} of this year's movies")
+    added = 0
+    for r, video in candidates:
+        if OPENSUBTITLES_DOWN:
+            print("  OpenSubtitles quota used up; the rest will be tried on a later run")
+            break
+        content = download_chinese_subtitle(r["imdb_id"])
+        if content:
+            dest = video.parent / f"{video.stem}.chi.srt"
+            dest.write_bytes(content)
+            added += 1
+    if added:
+        print(f"  saved {added} subtitle(s)")
+
+
 def main():
     if not OMDB:
         sys.exit("Set OMDB_API_KEY in env or .env")
@@ -548,6 +677,8 @@ def main():
     CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
     rows = [cache[m["path"]] for m in movies]
     rows.sort(key=lambda r: (r.get("name") or r["title"]).lower())
+    download_missing_subtitles(rows)
+    annotate_subtitle_flag(rows)
     discover = build_discover(cache, rows)
     disc_grids = "".join(f'<div class="grid" data-y="{html.escape(y)}">{"".join(map(card, movies))}</div>'
                           for y, movies in discover.items())
