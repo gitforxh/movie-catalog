@@ -423,11 +423,15 @@ s.onchange=go;go();
 
 
 def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
-    """Highly rated (TMDB score > 7.5) movies for `year` that aren't already in the library.
-    Each is a full card row, same shape as a library movie, minus a NAS "path"."""
+    """Highly rated (real IMDb score > 7.5, via OMDb - more reputable than TMDB's own user score)
+    movies for `year` that aren't already in the library. Each is a full card row, same shape as a
+    library movie, minus a NAS "path". Candidates are still pulled from TMDB sorted by its own vote
+    average - a fine proxy ordering to check the most-likely-to-qualify titles first - but the actual
+    7.5 cutoff is applied to the real IMDb rating."""
+    global OMDB_DOWN
     out, checked = [], 0
     for page in (1, 2):
-        if len(out) >= limit or checked >= max_checked:
+        if len(out) >= limit or checked >= max_checked or OMDB_DOWN:
             break
         try:
             results = tmdb("/discover/movie", primary_release_year=year, sort_by="vote_average.desc",
@@ -435,34 +439,54 @@ def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
         except Exception:
             break
         for d in results:
-            if len(out) >= limit or checked >= max_checked:
+            if len(out) >= limit or checked >= max_checked or OMDB_DOWN:
                 break
             checked += 1
-            score = tmdb_score(d)
-            if not score or float(score) <= 7.5:
-                continue
             try:
                 row = tmdb_details({"path": None}, d["id"], "en-US")
             except Exception:
                 continue
             if row.get("imdb_id") in exclude_imdb_ids:
                 continue
+            imdb_score = None
+            try:
+                o = get(f"https://www.omdbapi.com/?apikey={OMDB}&i={row['imdb_id']}")
+                imdb_score = None if o.get("imdbRating", "N/A") == "N/A" else o["imdbRating"]
+            except urllib.error.HTTPError as ex:
+                OMDB_DOWN = OMDB_DOWN or ex.code == 401
+                continue
+            except Exception:
+                continue
+            if not imdb_score or float(imdb_score) <= 7.5:
+                continue
+            row["imdb"], row["scored"] = imdb_score, True
             out.append(row)
-    out.sort(key=lambda r: -float(r["tmdb"]))
+    out.sort(key=lambda r: -float(r["imdb"]))
     return out
 
 
 def build_discover(cache, rows):
-    """{"2023": [...]} of highly rated movies per year not already in the library. Cached forever per year."""
+    """{"2023": [...]} of highly rated movies per year not already in the library. Cached forever per
+    year - so a year is only ever computed once OMDb is actually up, never left cached with too few
+    results just because the day's OMDb quota ran out partway through checking it (discover_year
+    needs a real IMDb rating per candidate, unlike the rest of the script, which can leave a movie's
+    score to fill in on a later run without dropping the movie itself)."""
     if not TMDB:
         return json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
     dcache = json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
     lib_imdb_ids = {c.get("imdb_id") for c in cache.values() if c.get("imdb_id")}
     years = sorted({r["year"] for r in rows if r.get("year")}, reverse=True)[:20]
     new_years = [y for y in years if y not in dcache]
-    if new_years:
+    if new_years and not OMDB:
+        print("skipping discover: needs OMDB_API_KEY (for real IMDb scores)")
+    elif new_years:
         print(f"finding highly rated movies for {len(new_years)} years you're missing")
     for y in new_years:
+        if OMDB_DOWN:
+            print(f"  OMDb daily limit reached; {y} and later years will be tried on a later run")
+            break
+        if not OMDB:
+            break
         dcache[y] = discover_year(int(y), lib_imdb_ids)
     stale = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and "country" not in m]
     if stale:  # cached before the TMDB id / country were added: fill them in (one call each, since tmdb_id is often already known)
