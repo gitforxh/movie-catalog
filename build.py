@@ -484,7 +484,10 @@ def build_discover(cache, rows):
     if not TMDB:
         return json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
     dcache = json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
-    lib_imdb_ids = {c.get("imdb_id") for c in cache.values() if c.get("imdb_id")}
+    # Only movies currently on the NAS (rows, from this run's scan()) - not every entry ever cached,
+    # which never gets pruned when a movie is deleted, so a deleted movie's imdb_id would otherwise
+    # stay "owned" forever and never come back to Discover.
+    lib_imdb_ids = {r.get("imdb_id") for r in rows if r.get("found") and r.get("imdb_id")}
     years = sorted({r["year"] for r in rows if r.get("year")}, reverse=True)[:20]
     new_years = [y for y in years if y not in dcache]
     if new_years and not OMDB:
