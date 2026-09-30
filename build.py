@@ -202,7 +202,9 @@ def tmdb_lookup(m):
         return tmdb_details(out, ov["tmdb"], lang)
     if ov.get("imdb"):
         res = tmdb(f"/find/{ov['imdb']}", external_source="imdb_id")["movie_results"]
-        return tmdb_details(out, res[0]["id"], lang) if res else out
+        if res:
+            return tmdb_details(out, res[0]["id"], lang)
+        return omdb_lookup_by_id(out, ov["imdb"]) or out
     q = {"query": m["title"], "language": lang}
     if m["year"]:
         q["year"] = m["year"]
@@ -305,6 +307,26 @@ def lookup(m):
         return dict(m, found=False, error=str(ex))
 
 
+def parse_omdb_response(out, o):
+    na = lambda v: None if v in (None, "N/A") else v
+    rt = next((r["Value"] for r in o.get("Ratings", []) if r["Source"] == "Rotten Tomatoes"), None)
+    out.update(
+        found=True,
+        name=o["Title"],
+        year=(na(o.get("Year")) or "")[:4],  # a series' "Year" can be a range like "2021-2024"
+        overview=na(o.get("Plot")) or "",
+        poster=na(o.get("Poster")),
+        genres=(na(o.get("Genre")) or "").split(", ") if na(o.get("Genre")) else [],
+        runtime=(na(o.get("Runtime")) or "").replace(" min", "") or None,
+        imdb_id=o.get("imdbID"),
+        released=iso_date(o.get("Released")),
+        imdb=na(o.get("imdbRating")),
+        rt=rt,
+        country=na(o.get("Country")) or "",
+    )
+    return out
+
+
 def omdb_lookup(m):
     out = dict(m, found=False)
     def q(**kw):
@@ -318,23 +340,25 @@ def omdb_lookup(m):
         o = q(i=hits[0]["imdbID"]) if hits else o
     if o.get("Response") == "False":
         return out
-    na = lambda v: None if v in (None, "N/A") else v
-    rt = next((r["Value"] for r in o.get("Ratings", []) if r["Source"] == "Rotten Tomatoes"), None)
-    out.update(
-        found=True,
-        name=o["Title"],
-        year=(na(o.get("Year")) or "")[:4],
-        overview=na(o.get("Plot")) or "",
-        poster=na(o.get("Poster")),
-        genres=(na(o.get("Genre")) or "").split(", ") if na(o.get("Genre")) else [],
-        runtime=(na(o.get("Runtime")) or "").replace(" min", "") or None,
-        imdb_id=o.get("imdbID"),
-        released=iso_date(o.get("Released")),
-        imdb=na(o.get("imdbRating")),
-        rt=rt,
-        country=na(o.get("Country")) or "",
-    )
-    return out
+    return parse_omdb_response(out, o)
+
+
+def omdb_lookup_by_id(out, imdb_id):
+    """OMDb's record for a known IMDb id, regardless of media type - unlike the title-search path
+    above, a direct id lookup isn't restricted to type=movie. Used as a fallback for a title that
+    exists on IMDb but has no *movie* entry on TMDB: usually a TV special or episode (or, sometimes,
+    a whole series saved as a single file) that got mixed into a movie folder."""
+    if not OMDB:
+        return None
+    try:
+        o = get(f"https://www.omdbapi.com/?apikey={OMDB}&i={imdb_id}&plot=short")
+    except Exception:
+        return None
+    if o.get("Response") == "False":
+        return None
+    row = parse_omdb_response(out, o)
+    row["media_type"] = o.get("Type")  # "movie" | "series" | "episode" - handy to know, not shown anywhere yet
+    return row
 
 
 def link(m):
@@ -372,7 +396,8 @@ def card(m):
     # suggestion rather than something you already own.
     badge_html = "" if m.get("path") else '<span class="discover-badge">Not in library</span>'
     return (f'<div class="card" data-t="{html.escape(m["name"].lower())}" data-imdb="{m.get("imdb") or 0}" '
-            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{year}" data-d="{m.get("released") or year + "-00-00"}">'
+            f'data-rt="{(m.get("rt") or "0").rstrip("%")}" data-tmdb="{m.get("tmdb") or 0}" data-y="{year}" data-d="{m.get("released") or year + "-00-00"}" '
+            f'data-c="{html.escape(m.get("country") or "")}" data-g="{html.escape(", ".join(m["genres"]))}">'
             f'{poster_tag}<div class="body">{badge_html}<h2>{html.escape(m["name"])}</h2>'
             f'<p class="meta">{html.escape(meta)}</p><div class="genres">{genres}</div><div class="badges">{badges}</div>'
             f'<p class="intro">{html.escape(m["overview"])}</p>'
@@ -402,7 +427,7 @@ main,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr)
 .body:has(.discover-badge) h2{padding-right:88px}
 </style>
 <header><h1 id="count">Movies (__N__)</h1><input id="q" placeholder="Search…"><select id="s">
-<option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select></header>
+<option value="imdb" selected>IMDb score</option><option value="t">Name (A–Z)</option><option value="d">Release date (newest)</option><option value="rt">Rotten Tomatoes</option><option value="tmdb">TMDB score</option></select><select id="yr"></select><select id="ct"></select><select id="gn"></select></header>
 <main id="m">__CARDS__</main>
 <div id="disc"><h3 id="discH"></h3>__DISCOVER_GRIDS__</div>
 <script>
@@ -417,17 +442,26 @@ function renderDiscover(y){
 const yr=document.getElementById('yr'),years=[...new Set(cards.map(c=>c.dataset.y).filter(Boolean))].sort().reverse();
 yr.innerHTML='<option value="">All years</option>'+years.map(y=>`<option>${y}</option>`).join('');
 const cur=String(new Date().getFullYear());yr.value=years.includes(cur)?cur:'';
-function go(){const q=document.getElementById('q').value.toLowerCase(),s=document.getElementById('s').value,y=yr.value;
+// A movie can list several countries (e.g. co-productions) in one comma-separated field - split
+// those out so each one gets its own dropdown entry and matches on its own.
+const ct=document.getElementById('ct'),countries=[...new Set(cards.flatMap(c=>(c.dataset.c||'').split(',').map(x=>x.trim()).filter(Boolean)))].sort();
+ct.innerHTML='<option value="">All countries</option>'+countries.map(c=>`<option>${c}</option>`).join('');
+const gn=document.getElementById('gn'),genres=[...new Set(cards.flatMap(c=>(c.dataset.g||'').split(',').map(x=>x.trim()).filter(Boolean)))].sort();
+gn.innerHTML='<option value="">All genres</option>'+genres.map(g=>`<option>${g}</option>`).join('');
+function go(){const q=document.getElementById('q').value.toLowerCase(),s=document.getElementById('s').value,y=yr.value,c2=ct.value,g2=gn.value;
 let shown=0;
-cards.forEach(c=>{const visible=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y);c.style.display=visible?'':'none';if(visible)shown++});
+cards.forEach(c=>{const visible=(c.dataset.t||c.textContent.toLowerCase()).includes(q)&&(!y||c.dataset.y===y)&&(!c2||(c.dataset.c||'').split(',').map(x=>x.trim()).includes(c2))&&(!g2||(c.dataset.g||'').split(',').map(x=>x.trim()).includes(g2));c.style.display=visible?'':'none';if(visible)shown++});
 [...cards].sort((a,b)=>s=='t'?(a.dataset.t||'~').localeCompare(b.dataset.t||'~'):s=='d'?(b.dataset.d||'').localeCompare(a.dataset.d||''):(+b.dataset[s]||0)-(+a.dataset[s]||0)).forEach(c=>m.appendChild(c));
 document.getElementById('count').textContent=shown===cards.length?`Movies (${cards.length})`:`Movies (${shown} of ${cards.length})`;
 renderDiscover(y)}
-// Searching for a specific movie shouldn't also require remembering to switch to "All years" first,
-// and picking a year is a fresh browse that shouldn't still be narrowed by an old search term.
+// Searching for a specific movie shouldn't also require remembering to switch to "All years"/"All
+// countries"/"All genres" first, and picking any of them is a fresh browse that shouldn't still be
+// narrowed by an old search term.
 const qInput=document.getElementById('q');
-qInput.oninput=()=>{if(qInput.value)yr.value='';go()};
+qInput.oninput=()=>{if(qInput.value){yr.value='';ct.value='';gn.value=''}go()};
 yr.onchange=()=>{if(qInput.value)qInput.value='';go()};
+ct.onchange=()=>{if(qInput.value)qInput.value='';go()};
+gn.onchange=()=>{if(qInput.value)qInput.value='';go()};
 s.onchange=go;go();
 </script>"""
 
@@ -664,6 +698,12 @@ def main():
     for v in cache.values():
         if not v.get("year") and v.get("released"):
             v["year"] = v["released"][:4]
+    # a "poster" override added/changed after a movie was already cached won't otherwise take effect
+    # until something else about it triggers a re-lookup (a poster override alone doesn't).
+    for v in cache.values():
+        ov_poster = (v.get("ov") or {}).get("poster")
+        if ov_poster and v.get("poster") != ov_poster:
+            v["poster"] = ov_poster
     movies = scan()
     todo = [m for m in movies if m["path"] not in cache
             or not cache[m["path"]].get("found") and ("error" in cache[m["path"]] or cache[m["path"]]["title"] != m["title"]
@@ -672,6 +712,11 @@ def main():
     print(f"{len(movies)} entries, {len(todo)} to look up")
     with ThreadPoolExecutor(8) as ex:
         for i, r in enumerate(ex.map(lookup, todo), 1):
+            # A "poster" override applies no matter which lookup path found the movie (by tmdb id,
+            # imdb id, title search, or OMDb) - none of those look at it themselves, only "manual"
+            # mode does, since it builds the whole row from the override alone.
+            if r.get("ov", {}).get("poster"):
+                r["poster"] = r["ov"]["poster"]
             cache[r["path"]] = r
             if i % 25 == 0:
                 print(f"  {i}/{len(todo)}")
