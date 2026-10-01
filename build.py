@@ -45,6 +45,22 @@ JUNK = re.compile(
 
 
 CJK = re.compile(r"[\u4e00-\u9fff]")
+
+# TMDB returns genre names localized to whatever language a request used, so a Chinese-titled movie
+# (looked up with language=zh-CN) gets Chinese genre names while everything else gets English -
+# splitting what should be one genre (e.g. "Drama"/"\u5267\u60c5") into two separate, unmergeable entries in
+# the genre filter. Normalize every genre name to TMDB's own English ones (its full standard movie
+# genre list) as soon as it's fetched, so movies.json/cache.json only ever store one canonical name.
+GENRE_ZH_TO_EN = {
+    "\u52a8\u4f5c": "Action", "\u5192\u9669": "Adventure", "\u52a8\u753b": "Animation", "\u559c\u5267": "Comedy", "\u72af\u7f6a": "Crime",
+    "\u7eaa\u5f55": "Documentary", "\u7eaa\u5f55\u7247": "Documentary", "\u5267\u60c5": "Drama", "\u5bb6\u5ead": "Family", "\u5947\u5e7b": "Fantasy",
+    "\u5386\u53f2": "History", "\u6050\u6016": "Horror", "\u97f3\u4e50": "Music", "\u60ac\u7591": "Mystery", "\u7231\u60c5": "Romance",
+    "\u79d1\u5e7b": "Science Fiction", "\u7535\u89c6\u7535\u5f71": "TV Movie", "\u60ca\u609a": "Thriller", "\u6218\u4e89": "War", "\u897f\u90e8": "Western",
+}
+
+
+def normalize_genres(names):
+    return [GENRE_ZH_TO_EN.get(g, g) for g in names]
 CJK_CUT = re.compile(r"(?i)(HDTC|HD|BD|TC|DVD|TS|WEB|BluRay|\d{3,4}p|4K)")
 
 
@@ -230,7 +246,7 @@ def tmdb_details(out, tid, lang):
         released=d.get("release_date") or None,
         overview=d.get("overview", ""),
         poster=d.get("poster_path") and "https://image.tmdb.org/t/p/w342" + d["poster_path"],
-        genres=[g["name"] for g in d.get("genres", [])],
+        genres=normalize_genres(g["name"] for g in d.get("genres", [])),
         runtime=str(d["runtime"]) if d.get("runtime") else None,
         imdb_id=d.get("imdb_id") or None,
         imdb=None, rt=None, au=au, tmdb=tmdb_score(d), tmdb_id=tid, country=countries_of(d),
@@ -704,6 +720,10 @@ def main():
         ov_poster = (v.get("ov") or {}).get("poster")
         if ov_poster and v.get("poster") != ov_poster:
             v["poster"] = ov_poster
+    # a movie cached before GENRE_ZH_TO_EN existed can still have Chinese genre names in it.
+    for v in cache.values():
+        if v.get("genres"):
+            v["genres"] = normalize_genres(v["genres"])
     movies = scan()
     todo = [m for m in movies if m["path"] not in cache
             or not cache[m["path"]].get("found") and ("error" in cache[m["path"]] or cache[m["path"]]["title"] != m["title"]
@@ -715,7 +735,7 @@ def main():
             # A "poster" override applies no matter which lookup path found the movie (by tmdb id,
             # imdb id, title search, or OMDb) - none of those look at it themselves, only "manual"
             # mode does, since it builds the whole row from the override alone.
-            if r.get("ov", {}).get("poster"):
+            if (r.get("ov") or {}).get("poster"):
                 r["poster"] = r["ov"]["poster"]
             cache[r["path"]] = r
             if i % 25 == 0:
@@ -725,7 +745,25 @@ def main():
         print(f"adding release dates to {len(old)} cached movies")
         with ThreadPoolExecutor(8) as ex:
             list(ex.map(backfill_date, old))
-    todo_scores = [c for c in cache.values() if c.get("src") == "tmdb" and c.get("imdb_id") and not c.get("scored")]
+    def score_still_pending(c):
+        """True if a TMDB-sourced movie hasn't been scored yet, or was "scored" with no real IMDb
+        rating (OMDb's imdbRating: N/A) for a recent release that may simply not have one *yet* -
+        e.g. one that just released - and so is worth asking OMDb about again on a later run, rather
+        than treated as a permanently settled "no score exists" the way an old movie's N/A would be."""
+        if not c.get("scored"):
+            return True
+        if c.get("imdb") is not None:
+            return False
+        released = c.get("released")
+        if not released:
+            return False
+        try:
+            age_days = (datetime.now() - datetime.strptime(released, "%Y-%m-%d")).days
+        except ValueError:
+            return False
+        return 0 <= age_days <= 180
+
+    todo_scores = [c for c in cache.values() if c.get("src") == "tmdb" and c.get("imdb_id") and score_still_pending(c)]
     if todo_scores and OMDB:
         print(f"adding IMDb/RT scores to {len(todo_scores)} TMDB-sourced movies")
         with ThreadPoolExecutor(8) as ex:
