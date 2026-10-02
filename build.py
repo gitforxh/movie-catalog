@@ -5,7 +5,7 @@ Usage: python3 build.py [folder ...]   (default: /Volumes/movies and /Volumes/mo
 Key: OMDB_API_KEY in env or in ./.env
 Results are cached in cache.json, so re-runs only look up new movies.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import html, json, os, re, sys, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -482,25 +482,28 @@ s.onchange=go;go();
 </script>"""
 
 
-def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
+def _discover(params, exclude_imdb_ids, limit, max_checked, known_tmdb_ids):
     """Highly rated (real IMDb score > 7.5, via OMDb - more reputable than TMDB's own user score)
-    movies for `year` that aren't already in the library. Each is a full card row, same shape as a
-    library movie, minus a NAS "path". Candidates are still pulled from TMDB sorted by its own vote
-    average - a fine proxy ordering to check the most-likely-to-qualify titles first - but the actual
-    7.5 cutoff is applied to the real IMDb rating."""
+    movies matching a TMDB /discover query, that aren't already in the library. Each is a full card
+    row, same shape as a library movie, minus a NAS "path". Candidates are pulled from TMDB sorted by
+    its own vote average - a fine proxy ordering to check the most-likely-to-qualify titles first -
+    but the actual 7.5 cutoff is applied to the real IMDb rating. `known_tmdb_ids` (already cached)
+    are skipped without using up the max_checked budget, so a re-check spends it on candidates it
+    hasn't seen rather than re-checking the same top few every time."""
     global OMDB_DOWN
     out, checked = [], 0
     for page in (1, 2):
         if len(out) >= limit or checked >= max_checked or OMDB_DOWN:
             break
         try:
-            results = tmdb("/discover/movie", primary_release_year=year, sort_by="vote_average.desc",
-                            page=page, **{"vote_count.gte": 1000})["results"]
+            results = tmdb("/discover/movie", sort_by="vote_average.desc", page=page, **params)["results"]
         except Exception:
             break
         for d in results:
             if len(out) >= limit or checked >= max_checked or OMDB_DOWN:
                 break
+            if d["id"] in known_tmdb_ids:
+                continue
             checked += 1
             try:
                 row = tmdb_details({"path": None}, d["id"], "en-US")
@@ -525,9 +528,34 @@ def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
     return out
 
 
+def discover_year(year, exclude_imdb_ids, limit=10, max_checked=40):
+    return _discover({"primary_release_year": year, "vote_count.gte": 1000}, exclude_imdb_ids, limit, max_checked, ())
+
+
+# Released within this many days counts as "recent" - a window rather than a calendar year, so it keeps
+# working across a year boundary (in January it still covers late last year).
+RECENT_DAYS = 180
+
+
+def discover_recent(exclude_imdb_ids, known_tmdb_ids, limit=10, max_checked=40):
+    """Newly qualifying movies from the last RECENT_DAYS days. A lower vote floor than a full year's
+    (500, not 1000), since a recent release hasn't had time to collect as many votes."""
+    now = datetime.now().date()
+    params = {
+        "primary_release_date.gte": (now - timedelta(days=RECENT_DAYS)).isoformat(),
+        "primary_release_date.lte": now.isoformat(),
+        "vote_count.gte": 500,
+    }
+    return _discover(params, exclude_imdb_ids, limit, max_checked, known_tmdb_ids)
+
+
+DISCOVER_YEAR_CAP = 20  # most movies kept per year once re-checking can add to it
+
+
 def build_discover(cache, rows):
-    """{"2023": [...]} of highly rated movies per year not already in the library. Cached forever per
-    year - so a year is only ever computed once OMDb is actually up, never left cached with too few
+    """{"2023": [...]} of highly rated movies per year not already in the library. Cached per year, and
+    only added to afterwards (plus a re-check of recent releases, see discover_recent) - so a year
+    is only ever first computed once OMDb is actually up, never left cached with too few
     results just because the day's OMDb quota ran out partway through checking it (discover_year
     needs a real IMDb rating per candidate, unlike the rest of the script, which can leave a movie's
     score to fill in on a later run without dropping the movie itself)."""
@@ -551,6 +579,19 @@ def build_discover(cache, rows):
         if not OMDB:
             break
         dcache[y] = discover_year(int(y), lib_imdb_ids)
+    # Re-check what's been released recently, across year boundaries, for newly qualifying movies: new
+    # releases, and ratings that settle above the cutoff after a title was first looked at. Finds are
+    # added to their release year's cached list, never replacing it.
+    if OMDB and not OMDB_DOWN:
+        known = {m.get("tmdb_id") for ms in dcache.values() for m in ms if m.get("tmdb_id")}
+        known_imdb = {m.get("imdb_id") for ms in dcache.values() for m in ms}
+        fresh = discover_recent(lib_imdb_ids | known_imdb, known)
+        for m in fresh:
+            y = m.get("year") or (m.get("released") or "")[:4]
+            if y:
+                dcache[y] = sorted(dcache.get(y, []) + [m], key=lambda x: -float(x.get("imdb") or 0))[:DISCOVER_YEAR_CAP]
+        if fresh:
+            print(f"  found {len(fresh)} new highly rated movie(s) released in the last {RECENT_DAYS} days")
     stale = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and "country" not in m]
     if stale:  # cached before the TMDB id / country were added: fill them in (one call each, since tmdb_id is often already known)
         print(f"adding TMDB id/country to {len(stale)} discovered movies")
