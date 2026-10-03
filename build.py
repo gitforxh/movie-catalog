@@ -791,6 +791,13 @@ def is_english_subtitle(path):
 
 
 OPENSUBTITLES_DOWN = False
+OPENSUBTITLES_QUOTA = {}  # the latest "remaining downloads / when it resets" the API told us
+
+
+def _note_quota(info):
+    """Remembers the quota details from a download response (or from the error one that says it's used up)."""
+    if isinstance(info, dict) and ("remaining" in info or "message" in info):
+        OPENSUBTITLES_QUOTA.update({k: info[k] for k in ("remaining", "reset_time", "reset_time_utc", "message") if k in info})
 
 
 def download_subtitle(imdb_id, language="zh-cn"):
@@ -824,6 +831,7 @@ def download_subtitle(imdb_id, language="zh-cn"):
             method="POST",
         )
         info = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        _note_quota(info)
         link = info.get("link")
         if not link:
             return None
@@ -833,9 +841,31 @@ def download_subtitle(imdb_id, language="zh-cn"):
         return urllib.request.urlopen(file_req, timeout=30).read()
     except urllib.error.HTTPError as ex:
         OPENSUBTITLES_DOWN = OPENSUBTITLES_DOWN or ex.code in (401, 403, 406, 429)
+        try:
+            _note_quota(json.loads(ex.read()))  # the "quota used up" reply says when it renews
+        except Exception:
+            pass
         return None
     except Exception:
         return None
+
+
+def _quota_line():
+    q = OPENSUBTITLES_QUOTA
+    if not q:
+        return None
+    resets = ""
+    if q.get("reset_time"):
+        resets = f", resets in {q['reset_time']}"
+        try:  # also as a local clock time
+            at = datetime.fromisoformat(q["reset_time_utc"].replace("Z", "+00:00")).astimezone()
+            resets += f" (at {at:%H:%M})"
+        except (KeyError, ValueError):
+            pass
+    if "remaining" in q:
+        left = max(q["remaining"], 0)  # the API reports -1 once you're over
+        return f"[subtitles] OpenSubtitles quota: {left} download(s) left{' - used up' if not left else ''}{resets}"
+    return f"[subtitles] OpenSubtitles: {q['message'].strip()}"
 
 
 def _subtitle_state(r):
@@ -955,6 +985,8 @@ def update_subtitles(rows, year=None):
         if not_tried:
             _print_names(f"  not tried, OpenSubtitles quota used up ({len(not_tried)}) - will be tried on a later run:", not_tried)
 
+    if need and OPENSUBTITLES and _quota_line():
+        print(_quota_line())
     zh_paths = {r["path"] for r in saved_zh}
     en_paths = {r["path"] for r in saved_en}
     changed = []
