@@ -17,6 +17,9 @@ No server and no dependencies: one Python script that uses only the standard lib
    OMDB_API_KEY=your_omdb_key
    TMDB_API_KEY=your_tmdb_key
    OPENSUBTITLES_API_KEY=your_opensubtitles_key
+   # Optional: use a self-hosted torrent indexer/search service.
+   # The value may contain {query}, {title}, and {year} placeholders.
+   TORRENT_SEARCH_URL=https://www.google.com/search?q={query}
    ```
 
    `.env` is git-ignored. Either a TMDB v3 API key or a v4 read-access token works.
@@ -26,14 +29,18 @@ No server and no dependencies: one Python script that uses only the standard lib
 ```bash
 python3 build.py                 # scans /Volumes/movies and /Volumes/movies-2T
 python3 build.py /path/to/movies # or scan your own folder(s)
+python3 build.py -g              # regenerate movies.html from existing movies.json only
+python3 build.py -n              # scan/look up new disk entries; skip existing score queries and discovery
+python3 build.py -s 2024         # check/download subtitles only for movies from 2024
+python3 build.py -h              # show the options
 open movies.html
 ```
 
-Run it again whenever you add movies or edit `overrides.json`. Lookups are cached in `cache.json`, so a re-run only fetches what's new or changed.
+Run it again whenever you add movies or edit `overrides.json`. Lookups are cached in `cache.json`, so a re-run only fetches what's new or changed. Use `-g` when you only want to regenerate the HTML and do not want to scan folders or make API queries.
 
 ## Chinese subtitles for this year's movies
 
-With `OPENSUBTITLES_API_KEY` set, each run checks this year's movies for one that has no subtitle file next to it yet (older movies are assumed to already have one, so they're skipped) and downloads the most-downloaded Chinese (Simplified) subtitle for it from OpenSubtitles, saved as `<video name>.chi.srt`. OpenSubtitles' free tier has a small daily download quota; once it's used up for the day, the rest are left for a later run rather than skipped for good.
+With `OPENSUBTITLES_API_KEY` set, each run checks this year's movies for one with no **Chinese** subtitle next to it (older movies are assumed to already have one, so they're skipped). For each it downloads the most-downloaded Chinese (Simplified) subtitle from OpenSubtitles, saved as `<video name>.chi.srt`; if OpenSubtitles has no Chinese one, it falls back to English, saved as `<video name>.eng.srt` (a movie that already has an English subtitle is left alone). A subtitle's language is decided by reading the file (GBK, Big5, UTF-8 and UTF-16 are all handled; bilingual Chinese/English counts as Chinese), not from its name, so a movie that only has an English subtitle still gets a Chinese one when there is one. Subtitles built into the video file aren't detected. The badge on each movie shows **CN** (a Chinese subtitle file) or **EN** (English only). OpenSubtitles' free tier has a small daily download quota; once it's used up for the day, the rest are left for a later run rather than skipped for good.
 
 The OMDb free tier allows 1,000 requests a day. If the limit is hit, the script carries on with TMDB alone and adds the IMDb and Rotten Tomatoes scores on a later run.
 
@@ -61,6 +68,7 @@ To change the skipped folders, edit `SKIP_DIRS` at the top of `build.py`.
 - Search, and a year filter (defaults to the current year, or All years if there are none).
 - Sort by IMDb score (default), name, release date, Rotten Tomatoes or TMDB score.
 - Click a poster to open that movie's folder in a new browser tab (a `file://` link, so it works best in Chrome-based browsers).
+- Discovered movies include a **Search torrents** link. By default it opens a normal web search; set `TORRENT_SEARCH_URL` in `.env` to use a self-hosted indexer or another search endpoint.
 
 ## Fixing wrong or missing matches: `overrides.json`
 

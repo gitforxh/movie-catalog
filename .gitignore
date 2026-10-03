@@ -4,3 +4,4 @@ cache.json
 movies.html
 overrides.json
 discover_cache.json
+.DS_Store
