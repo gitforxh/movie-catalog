@@ -11,17 +11,26 @@ Options:
   -g          Regenerate movies.html from the existing movies.json only: no folder scan, no network.
   -n          Scan for new movies only: look up what's new on disk, but don't re-query scores for
               existing movies, and don't discover new ones.
+  -m MOVIE    Update one movie only, with everything a full run would do for it: look it up again,
+              refresh its scores, and check/download its subtitle. MOVIE is part of its name, or its
+              path; if several movies match, they're listed so you can be more specific. Doesn't
+              scan the folders; needs an existing movies.json.
   -s YEAR     Check/download subtitles for that year's movies only, and update their CN/EN badge.
               Doesn't scan the folders; needs an existing movies.json.
+  -d          Discovery only: look for highly rated movies released in the last 180 days that you
+              don't have, add them to the discover lists. Doesn't scan the folders; needs an
+              existing movies.json.
   -h, --help  Show this help.
 
   folder ...  Movie folders to scan instead of the defaults (/Volumes/movies, /Volumes/movies-2T).
-              If options are combined, -g wins over -s, which wins over -n.
+              If options are combined, -g wins over -m, which wins over -s, which wins over -d, which wins over -n.
 
 Examples:
   python3 build.py                     full run
   python3 build.py -n                  just pick up new movies
+  python3 build.py -m "Project Hail"   update just that movie
   python3 build.py -s 2024             subtitles for 2024 only
+  python3 build.py -d                  discover new high-scoring recent movies only
   python3 build.py /path/to/movies     scan your own folder
 
 Keys, in the environment or in ./.env: OMDB_API_KEY (required; -g and -s don't need it),
@@ -39,18 +48,26 @@ if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
     sys.exit(0)
 GENERATE_ONLY = "-g" in sys.argv[1:]
 SCAN_ONLY = "-n" in sys.argv[1:]
+DISCOVER_ONLY = "-d" in sys.argv[1:]
 SUBTITLE_YEAR = None
+MOVIE_QUERY = None
 _cli_args = list(sys.argv[1:])
+if "-m" in _cli_args:
+    _movie_index = _cli_args.index("-m")
+    if _movie_index + 1 >= len(_cli_args) or _cli_args[_movie_index + 1].startswith("-"):
+        sys.exit("-m needs a movie name or path, e.g. -m \"Michael\" (see -h for all options)")
+    MOVIE_QUERY = _cli_args[_movie_index + 1]
+    del _cli_args[_movie_index:_movie_index + 2]
 if "-s" in _cli_args:
     _subtitle_index = _cli_args.index("-s")
     if _subtitle_index + 1 >= len(_cli_args) or not re.fullmatch(r"(?:19|20)\d{2}", _cli_args[_subtitle_index + 1]):
         sys.exit("-s needs a year, e.g. -s 2024 (see -h for all options)")
     SUBTITLE_YEAR = _cli_args[_subtitle_index + 1]
     del _cli_args[_subtitle_index:_subtitle_index + 2]
-_unknown = [a for a in _cli_args if a.startswith("-") and a not in {"-g", "-n"}]
+_unknown = [a for a in _cli_args if a.startswith("-") and a not in {"-g", "-n", "-d"}]
 if _unknown:  # otherwise a typo like "-x" would quietly be taken for a folder to scan
     sys.exit(f"Unknown option {_unknown[0]} (see -h for the options)")
-CLI_ROOTS = [p for p in _cli_args if p not in {"-g", "-n"}]
+CLI_ROOTS = [p for p in _cli_args if p not in {"-g", "-n", "-d"}]
 ROOTS = [Path(p) for p in CLI_ROOTS] or [Path("/Volumes/movies"), Path("/Volumes/movies-2T")]
 SKIP_DIRS = {"TV", "tmp", "TVseries", "upload", "4k", "movie-catalog"}
 VIDEO = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
@@ -144,6 +161,24 @@ def parse_name(name):
     return title.strip(), year
 
 
+def make_entry(e, root):
+    """The catalog entry for one movie file/folder `e` under `root`, as scan() builds it - or None if
+    it has no usable title or an override hides it."""
+    title, year = parse_name(e.name)
+    if not title:
+        return None
+    p = str(e.relative_to(root.parent))  # relative to /Volumes
+    ov = OVERRIDES.get(p)
+    if ov and ov.get("hide"):
+        return None
+    if ov:
+        title, year = ov.get("title", title), ov.get("year", year)
+    # tmdb_lookup/omdb_lookup store a found movie's year as a string (from a release date), so an
+    # unmatched one needs to match that type too - otherwise a mix of str and int years in the final
+    # rows breaks sorting them later.
+    return {"title": title, "year": str(year) if year is not None else None, "path": p, "ov": ov}
+
+
 def scan():
     found = {}
     for root in ROOTS:
@@ -166,18 +201,9 @@ def scan():
                 if re.search(r"\bS\d{2}E\d{2}\b", e.name, re.I):
                     continue  # TV episode
                 if e.is_dir() or e.suffix.lower() in VIDEO:
-                    title, year = parse_name(e.name)
-                    if title:
-                        p = str(e.relative_to(root.parent))  # relative to /Volumes
-                        ov = OVERRIDES.get(p)
-                        if ov and ov.get("hide"):
-                            continue
-                        if ov:
-                            title, year = ov.get("title", title), ov.get("year", year)
-                        # tmdb_lookup/omdb_lookup store a found movie's year as a string (from a
-                        # release date), so an unmatched one needs to match that type too - otherwise
-                        # a mix of str and int years in the final rows breaks sorting them later.
-                        found[p] = {"title": title, "year": str(year) if year is not None else None, "path": p, "ov": ov}
+                    entry = make_entry(e, root)
+                    if entry:
+                        found[entry["path"]] = entry
     return list(found.values())
 
 
@@ -615,6 +641,27 @@ def discover_recent(exclude_imdb_ids, known_tmdb_ids, limit=10, max_checked=40):
 DISCOVER_YEAR_CAP = 20  # most movies kept per year once re-checking can add to it
 
 
+def recheck_recent(dcache, lib_imdb_ids):
+    """Add newly qualifying movies from the last RECENT_DAYS days to dcache (in place)."""
+    # Re-check what's been released recently, across year boundaries, for newly qualifying movies: new
+    # releases, and ratings that settle above the cutoff after a title was first looked at. Finds are
+    # added to their release year's cached list, never replacing it.
+    if OMDB and not OMDB_DOWN:
+        known = {m.get("tmdb_id") for ms in dcache.values() for m in ms if m.get("tmdb_id")}
+        known_imdb = {m.get("imdb_id") for ms in dcache.values() for m in ms}
+        fresh = discover_recent(lib_imdb_ids | known_imdb, known)
+        for m in fresh:
+            y = m.get("year") or (m.get("released") or "")[:4]
+            if y:
+                dcache[y] = sorted(dcache.get(y, []) + [m], key=lambda x: -float(x.get("imdb") or 0))[:DISCOVER_YEAR_CAP]
+        kept = [m for m in fresh if any(x.get("imdb_id") == m.get("imdb_id")
+                                        for x in dcache.get(m.get("year") or (m.get("released") or "")[:4], []))]
+        print(f"[discover] last {RECENT_DAYS} days: {len(kept)} new highly rated movie(s)" if kept
+              else f"[discover] last {RECENT_DAYS} days: nothing new")
+        for m in kept:
+            print(f"  + {_movie_line(m)}")
+
+
 def build_discover(cache, rows):
     """{"2023": [...]} of highly rated movies per year not already in the library. Cached per year, and
     only added to afterwards (plus a re-check of recent releases, see discover_recent) - so a year
@@ -645,23 +692,7 @@ def build_discover(cache, rows):
         print(f"[discover] {y}: {len(dcache[y])} highly rated movie(s) found")
         for m in dcache[y]:
             print(f"  + {_movie_line(m)}")
-    # Re-check what's been released recently, across year boundaries, for newly qualifying movies: new
-    # releases, and ratings that settle above the cutoff after a title was first looked at. Finds are
-    # added to their release year's cached list, never replacing it.
-    if OMDB and not OMDB_DOWN:
-        known = {m.get("tmdb_id") for ms in dcache.values() for m in ms if m.get("tmdb_id")}
-        known_imdb = {m.get("imdb_id") for ms in dcache.values() for m in ms}
-        fresh = discover_recent(lib_imdb_ids | known_imdb, known)
-        for m in fresh:
-            y = m.get("year") or (m.get("released") or "")[:4]
-            if y:
-                dcache[y] = sorted(dcache.get(y, []) + [m], key=lambda x: -float(x.get("imdb") or 0))[:DISCOVER_YEAR_CAP]
-        kept = [m for m in fresh if any(x.get("imdb_id") == m.get("imdb_id")
-                                        for x in dcache.get(m.get("year") or (m.get("released") or "")[:4], []))]
-        print(f"[discover] last {RECENT_DAYS} days: {len(kept)} new highly rated movie(s)" if kept
-              else f"[discover] last {RECENT_DAYS} days: nothing new")
-        for m in kept:
-            print(f"  + {_movie_line(m)}")
+    recheck_recent(dcache, lib_imdb_ids)
     stale = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and "country" not in m]
     if stale:  # cached before the TMDB id / country were added: fill them in (one call each, since tmdb_id is often already known)
         print(f"adding TMDB id/country to {len(stale)} discovered movies")
@@ -679,6 +710,25 @@ def build_discover(cache, rows):
     # rebuild of the whole (rate-limited) discover cache. Only what's actually shown/exported is
     # filtered against the *current* library, fresh on every run.
     return {y: [m for m in ms if m.get("imdb_id") not in lib_imdb_ids] for y, ms in dcache.items()}
+
+
+def discover_recent_only():
+    """-d: just the last-RECENT_DAYS-days discovery, against the existing movies.json and discover cache."""
+    if not TMDB:
+        sys.exit("-d needs TMDB_API_KEY")
+    print(f"[discover] recent-only mode: last {RECENT_DAYS} days; no folder scan")
+    catalog = json.loads((HERE / "movies.json").read_text())
+    dcache = json.loads(DISCOVER_CACHE.read_text()) if DISCOVER_CACHE.exists() else {}
+    lib_imdb_ids = {m.get("imdb_id") for m in catalog.get("movies", []) if m.get("imdb_id")}
+    recheck_recent(dcache, lib_imdb_ids)
+    stale = [m for y in dcache for m in dcache[y] if m.get("imdb_id") and "country" not in m]
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(backfill_au, stale))
+    DISCOVER_CACHE.write_text(json.dumps(dcache, ensure_ascii=False, indent=1))
+    catalog["discover"] = {y: [m for m in ms if m.get("imdb_id") not in lib_imdb_ids] for y, ms in dcache.items()}
+    publish_json(catalog)
+    write_html(catalog["movies"] + unmatched_cards(catalog), catalog["discover"])
+    print(f"[discover] ready: {sum(map(len, catalog['discover'].values()))} movies across {len(catalog['discover'])} years")
 
 
 def abs_path_for(catalog_path):
@@ -911,13 +961,15 @@ def sub_badge(r):
     return r.get("sub") or ("CN" if r.get("has_sub") else None)
 
 
-def update_subtitles(rows, year=None):
+def update_subtitles(rows, year=None, any_year=False, label=None):
     """Downloads a subtitle for each movie of `year` (default: the current year) that has no Chinese
     one: Chinese if OpenSubtitles has it, otherwise English - unless the movie already has an English
     one, which is then left as it is. Then sets the SUB badge (`sub`: "CN", else "EN", else None) on
     every row in `rows`. Only one year is worth the (rate-limited) download calls - older movies are
     assumed to already have subtitles. Each movie's folder is read from the NAS once, in parallel, and
-    that result is reused for the badge afterwards."""
+    that result is reused for the badge afterwards. `any_year` downloads for every movie in `rows`
+    whatever its year (-n and -m, where `rows` is just the movie(s) being updated); `label` names them in
+    the log."""
     year = year or str(datetime.now().year)
     on_disk = [r for r in rows if r.get("found") and r.get("path")]
     print(f"[subtitles] reading {len(on_disk)} movie folder(s) on the NAS for subtitle files...")
@@ -933,7 +985,7 @@ def update_subtitles(rows, year=None):
 
     n = {"zh": 0, "en": 0, "other": 0, None: 0}
     need, no_id, no_video = [], 0, 0
-    in_year = [r for r in on_disk if r.get("year") == year]
+    in_year = on_disk if any_year else [r for r in on_disk if r.get("year") == year]
     for r in in_year:
         video, lang = state[r["path"]]
         if not video:
@@ -946,7 +998,7 @@ def update_subtitles(rows, year=None):
             no_id += 1
         else:
             need.append((r, video, lang))
-    print(f"[subtitles] {year}: {len(in_year)} movies - {n['zh']} Chinese subtitle, {n['en']} English only, "
+    print(f"[subtitles] {label or ('new movies' if any_year else year)}: {len(in_year)} movie(s) - {n['zh']} Chinese subtitle, {n['en']} English only, "
           f"{n['other']} other language only, {n[None]} none"
           + (f", {no_video} with no video file found" if no_video else "")
           + (f" ({no_id} can't be looked up: no IMDb id)" if no_id else ""))
@@ -1005,6 +1057,74 @@ def update_subtitles(rows, year=None):
     _print_names(f"[subtitles] SUB badges: {len(changed)} changed" + (":" if changed else ""), changed)
 
 
+def update_one_movie(query):
+    """-m MOVIE: everything a full run does, but for one movie - look it up again from scratch, refresh
+    its scores, and check/download its subtitle. It's found among the cache's entries by part of its
+    name or path (it has to still be on disk), and only that movie is touched in cache.json,
+    movies.json and movies.html - no folder scan, no discovery."""
+    catalog_file = HERE / "movies.json"
+    if not catalog_file.exists():
+        sys.exit("-m needs an existing movies.json - run a full scan first")
+    print("[init] loading cache.json and movies.json")
+    cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
+    catalog = json.loads(catalog_file.read_text())
+
+    q = query.strip().lower()
+    fields = lambda v: (v["path"].lower(), (v.get("name") or "").lower(), (v.get("title") or "").lower())
+    hits = [v for v in cache.values() if v.get("path") and any(q in f for f in fields(v))]
+    hits = [v for v in hits if abs_path_for(v["path"]).exists()]
+    exact = [v for v in hits if q in fields(v)]  # "Up" shouldn't also match every title containing "up"
+    hits = exact or hits
+    if not hits:
+        sys.exit(f'No movie on disk matches "{query}" (a movie that is new on disk is picked up by -n or a full run)')
+    if len(hits) > 1:
+        print(f'{len(hits)} movies match "{query}" - give a longer part of the name, or the exact path:')
+        for v in sorted(hits, key=lambda v: v["path"]):
+            print(f"  {v.get('name') or v.get('title')} ({v.get('year') or '?'}) - {v['path']}")
+        sys.exit(1)
+
+    path = hits[0]["path"]
+    root = next((r for r in ROOTS if r.name == path.split("/", 1)[0]), Path("/Volumes") / path.split("/", 1)[0])
+    entry = make_entry(abs_path_for(path), root)
+    if not entry:
+        sys.exit(f"{path} has no usable title, or an override hides it")
+    print(f"[movie] updating: {path}")
+    r = lookup(entry)
+    if (r.get("ov") or {}).get("poster"):
+        r["poster"] = r["ov"]["poster"]
+    if r.get("found"):
+        if r.get("imdb_id") and "released" not in r:
+            backfill_date(r)
+        if OMDB and r.get("src") == "tmdb" and r.get("imdb_id"):
+            backfill_scores(r)  # unconditionally - the point of -m is to re-ask
+        if TMDB and r.get("imdb_id"):
+            backfill_au(r)
+        print(f"[movie] {_movie_line(r)}")
+        r["sub"], r["has_sub"] = hits[0].get("sub"), hits[0].get("has_sub")  # so a badge change is reported as one
+        update_subtitles([r], any_year=True, label="this movie")
+    else:
+        print(f"[movie] NO MATCH for {entry['title']} - it will be listed as unmatched")
+        r["sub"], r["has_sub"] = None, False
+    cache[path] = r
+
+    # Patch just this movie into movies.json (and out of the discovery lists if it's in the library).
+    catalog["movies"] = [m for m in catalog.get("movies", []) if m.get("path") != path]
+    catalog["unmatched"] = [u for u in catalog.get("unmatched", []) if u.get("path") != path]
+    if not r.get("found"):
+        catalog["unmatched"].append({"title": r["title"], "year": r.get("year"), "path": path})
+    if r.get("found"):
+        catalog["movies"].append(slim(r))
+        catalog["movies"].sort(key=lambda m: (m.get("name") or m["title"]).lower())
+        catalog["discover"] = {y: [m for m in ms if not (r.get("imdb_id") and m.get("imdb_id") == r["imdb_id"])]
+                               for y, ms in catalog.get("discover", {}).items()}
+    CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
+    catalog["generated"] = datetime.now().isoformat(timespec="seconds")
+    print("[output] updating movies.json and movies.html")
+    publish_json(catalog)
+    write_html(catalog["movies"] + unmatched_cards(catalog), catalog.get("discover", {}))
+    report_unmatched([u["path"] for u in catalog.get("unmatched", [])])
+
+
 def subtitle_year_only(year):
     """-s YEAR: check/download subtitles for one year's movies, touching nothing else. The movies are
     the ones movies.json already lists for that year (so no folder scan and no per-movie disk check of
@@ -1028,8 +1148,8 @@ def subtitle_year_only(year):
     catalog["generated"] = datetime.now().isoformat(timespec="seconds")
     print("[output] updating movies.json and movies.html")
     publish_json(catalog)
-    # Rebuilt from movies.json, so (like -g) it doesn't show unmatched cards - run without -s for those.
-    write_html(catalog["movies"], catalog.get("discover", {}))
+    write_html(catalog["movies"] + unmatched_cards(catalog), catalog.get("discover", {}))
+    report_unmatched([u["path"] for u in catalog.get("unmatched", [])])
 
 
 def main():
@@ -1040,11 +1160,18 @@ def main():
         catalog = json.loads((HERE / "movies.json").read_text())
         rows = catalog.get("movies", [])
         discover = catalog.get("discover", {})
-        write_html(rows, discover)
+        write_html(rows + unmatched_cards(catalog), discover)
         print(f"[generate] wrote {HERE / 'movies.html'} ({len(rows)} library, {sum(map(len, discover.values()))} discovered)")
+        report_unmatched([u["path"] for u in catalog.get("unmatched", [])])
+        return
+    if MOVIE_QUERY:
+        update_one_movie(MOVIE_QUERY)
         return
     if SUBTITLE_YEAR:
         subtitle_year_only(SUBTITLE_YEAR)
+        return
+    if DISCOVER_ONLY:
+        discover_recent_only()
         return
     if SCAN_ONLY:
         print("[scan] incremental mode: existing movies will not be re-scored or rediscovered")
@@ -1165,7 +1292,7 @@ def main():
     new_rows = [r for r in rows if r.get("path") in new_paths]
     if SCAN_ONLY:
         if new_rows:
-            update_subtitles(new_rows)
+            update_subtitles(new_rows, any_year=True, label="new movies")  # whatever their year
         else:
             print("[subtitles] no new movies to check")
     else:
@@ -1184,15 +1311,23 @@ def main():
     print("[output] writing movies.html and movies.json")
     write_html(rows, discover)
     write_json(rows, discover)
-    misses = [r for r in rows if not r.get("found")]
-    print(f"unmatched: {len(misses)}  -> {HERE/'movies.html'}")
-    for m in misses:
-        print(f"  {m['path']}")
+    report_unmatched([r["path"] for r in rows if not r.get("found")])
 
 
 def slim(m):
     """A movie row without the internal/heavy fields (_tmdb, ov) - for movies.json, read by the Android TV app."""
     return {k: v for k, v in m.items() if k not in ("_tmdb", "ov", "error", "tried", "scored", "src")}
+
+
+def unmatched_cards(catalog):
+    """The movies.json "unmatched" entries as rows card() can show (the "No match found" cards)."""
+    return [dict(u, found=False) for u in catalog.get("unmatched", [])]
+
+
+def report_unmatched(paths):
+    print(f"unmatched: {len(paths)}  -> {HERE / 'movies.html'}")
+    for p in paths:
+        print(f"  {p}")
 
 
 def write_html(rows, discover):
@@ -1221,6 +1356,9 @@ def write_json(rows, discover):
     catalog = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "movies": [slim(r) for r in rows if r.get("found")],
+        # Folders with no match: not "movies" (no poster/scores, so the TV app would show blank cards),
+        # but kept so -g/-m/-s, which rebuild movies.html from this file, can still show their cards.
+        "unmatched": [{"title": r["title"], "year": r.get("year"), "path": r["path"]} for r in rows if not r.get("found")],
         "discover": {y: [slim(m) for m in ms] for y, ms in discover.items()},
     }
     publish_json(catalog)

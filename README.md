@@ -31,12 +31,14 @@ python3 build.py                 # scans /Volumes/movies and /Volumes/movies-2T
 python3 build.py /path/to/movies # or scan your own folder(s)
 python3 build.py -g              # regenerate movies.html from existing movies.json only
 python3 build.py -n              # scan/look up new disk entries; skip existing score queries and discovery
+python3 build.py -m "Hail Mary"   # update one movie only: look it up again, refresh scores, check/download its subtitle
 python3 build.py -s 2024         # check/download subtitles only for movies from 2024
+python3 build.py -d              # discover new high-scoring movies from the last 180 days only
 python3 build.py -h              # show the options
 open movies.html
 ```
 
-Run it again whenever you add movies or edit `overrides.json`. Lookups are cached in `cache.json`, so a re-run only fetches what's new or changed. Use `-g` when you only want to regenerate the HTML and do not want to scan folders or make API queries.
+Run it again whenever you add movies or edit `overrides.json`. Lookups are cached in `cache.json`, so a re-run only fetches what's new or changed. Folders that can't be matched are recorded under an `unmatched` key in `movies.json` (the TV app ignores it), so `-g`, `-m` and `-s` still show their "No match found" cards. Use `-g` when you only want to regenerate the HTML and do not want to scan folders or make API queries.
 
 ## Chinese subtitles for this year's movies
 
